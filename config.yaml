@@ -37,10 +37,14 @@ model:
   require_published_k: true           # no fair value (no trading) until the exchange publishes K, a few
                                       # seconds into each round; fallbacks below are only estimates
   k_fallback_to_oracle: true          # (only if require_published_k is false) K from the oracle's first print
-  # S (the "current" price). The spec uses the settlement oracle. NOTE (measured 2026-11-07): the BRTI
-  # series Polymarket US serves trails Coinbase spot by ~30-35s, so `oracle` makes fair value stale on
-  # fast moves; `spot` uses the fast feed (basis to BRTI is normally ~0.01%).
+  # S (the "current" price). The spec uses the settlement oracle, but the served index is a 60s average
+  # (see below), so `oracle` makes fair value ~30s stale on fast moves; `spot` uses the fast feed.
   s_source: spot                      # oracle | spot (the other is the fallback)
+  # The index Polymarket US serves IS a trailing 60s average of BRTI (tickCount 60 per 1s candle; K equals
+  # it at the window start) -- that's the "~30s lag". Basis is measured like for like (60s mean of spot vs
+  # the index) and, with s_source: spot, K is moved into spot's terms by it (basis_adjust).
+  oracle_average_seconds: 60
+  basis_adjust: true
   # Market rules: the open (K) and close are each the AVERAGE of 60 BRTI prints in the minute before.
   # 0 = the spec's point-settlement formula; 60 = model the averaging (matters most in the last ~2 min).
   settlement_average_seconds: 60
@@ -69,14 +73,15 @@ risk:
   max_usd_per_trade: 50
   max_usd_per_market: 100             # cost basis in one round
   max_open_markets: 4
-  daily_loss_stop: 150                # $ lost since the start of the ET day -> no new risk until tomorrow
-  basis_kill_pct: 0.05                # |spot - oracle| / oracle in PERCENT (0.05 = 0.05%) -> kill switch
+  basis_kill_pct: 0.05                # |60s-avg spot - oracle| / oracle in PERCENT (0.05 = 0.05%) -> kill switch
   require_both_feeds: true            # missing spot or oracle price also trips the kill switch
 
 # ---------------------------------------------------------------- portfolio
 portfolio:
   starting_bankroll: 1000             # each strategy has its own separate paper bankroll
-  stop_equity: 200                    # a strategy stops for good at this portfolio value (null = never)
+  stop_equity: 200                    # a strategy stops trading for good once its portfolio value (cash + open
+                                      # bets at the mid) is $200 or less; open bets still settle (null = never).
+                                      # This is the only stop: there is no daily loss limit.
 
 # ---------------------------------------------------------------- engine
 engine:
@@ -99,12 +104,19 @@ engine:
 strategies:
   s1_fair_value:
     enabled: true
-    name: s1_fair_value_v1
+    name: s1_fair_value_v2            # v2 (2026-11-07): model shrunk toward the market, stale-quote guards
     title: "S1 · Fair-value trader"
-    description: "Buys whichever side the model prices at least 4c above the ask (after fees); holds to the end."
+    description: "Buys a side when model+market fair value beats the ask by 4c after fees; skips jumps, huge gaps, longshots."
     markets: [5m, 15m]
     params:
       min_edge: 0.04
+      market_weight: 0.5              # fair = 50% model + 50% market mid (the market predicted better than the model alone)
+      max_model_gap: 0.25             # model vs mid further apart than this = data/stale-quote problem -> skip
+      min_price: 0.10
+      max_price: 0.90
+      max_spread: 0.05
+      jump_lookback_seconds: 5
+      jump_guard_sigmas: 3.0          # spot just jumped -> quotes are stale, a paper fill there isn't believable
       skip_first_seconds: 30
       skip_last_seconds: 10
       max_entries_per_window: 1
@@ -131,17 +143,12 @@ strategies:
 
   s3_sniper:
     enabled: true
-    name: s3_sniper_v1
+    name: s3_sniper_v2                # v2 (2026-11-07): buys the winning side in the last 60s, no other filters
     title: "S3 · End-of-window sniper"
-    description: "In the last minute(s), buys the near-certain side at 90-98c when z >= 2.5 and the feeds agree."
+    description: "In the last 60s of every 5m and 15m round, buys whichever side is winning (index vs price to beat)."
     markets: [5m, 15m]
     params:
-      snipe_window: {5m: 60, 15m: 120}
-      z_threshold: 2.5
-      min_ask: 0.90
-      max_ask: 0.98
-      min_edge: 0.01
-      max_basis_frac: 0.25
+      snipe_seconds: 60
       stake_usd: 25
 
   s4_momentum:
@@ -171,15 +178,18 @@ strategies:
 
   s5_complete_set:
     enabled: true
-    name: s5_complete_set_v1
-    title: "S5 · Complete-set arbitrage"
-    description: "Buys Up + Down when both cost <= $0.995 after fees; leg 2 filled after latency. (Never fires on Polymarket US: one book.)"
+    name: s5_complete_set_v2          # v2 (2026-11-07): legged-in set with take profit / stop loss / time exit
+    title: "S5 · Complete set (legged)"
+    description: "15s in, buys the pricier side; buys the opposite leg when leg 1's price is +10% or -5%, or at 30s left."
     markets: [5m, 15m]
     params:
-      min_profit: 0.005
-      near_miss_max_cost: 1.01
-      leg2_policy: breakeven
-      stake_usd: 50
+      entry_after_seconds: 15
+      take_profit_pct: 10             # leg 2 when leg 1's price is up 10% ...
+      stop_loss_pct: 5                # ... or down 5% ...
+      pnl_basis: price                # price = leg 1's price move | locked = whole set incl. fees + spread
+                                      # (locked starts at about -7.5%, so its 5% stop fires right after entry)
+      exit_seconds_left: 30           # ... or 30 seconds are left
+      stake_usd: 50                   # leg 1 dollars
 
   s6_mean_reversion:
     enabled: true

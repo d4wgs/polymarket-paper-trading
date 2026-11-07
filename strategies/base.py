@@ -33,8 +33,8 @@ Model / market data (core/fairvalue.py):
   ctx.spot / ctx.oracle / ctx.basis
   ctx.md.spot_at(ts) / ctx.md.oracle_at(ts)   -> price history (1s resolution for spot)
   ctx.kind                    -> "5m" / "15m" (from the window length)
-  ctx.edge(outcome)           -> fair - (best ask + taker fee per share)
-  ctx.max_price_for_edge(outcome, min_edge) -> highest price still giving edge >= min_edge
+  ctx.edge(outcome, fair=None)               -> fair - (best ask + taker fee per share)
+  ctx.max_price_for_edge(outcome, min_edge, fair=None) -> highest price still giving edge >= min_edge
   ctx.walk_cost(outcome, shares)            -> (shares fillable, avg price, total fee) from the real book
   ctx.entries_this_window     -> BUY fills this round (survives restarts)
   ctx.kill_switch             -> True while the basis kill switch is active (new risk is rejected anyway)
@@ -118,17 +118,18 @@ class TickContext:
         w = int(round(self.window_seconds))
         return f"{w // 3600}h" if w % 3600 == 0 else f"{w // 60}m"
 
-    def edge(self, outcome: str, price: Optional[float] = None) -> Optional[float]:
-        """fair value - (price + taker fee per share); price defaults to the best ask."""
-        fair = self.fair(outcome)
+    def edge(self, outcome: str, price: Optional[float] = None, fair: Optional[float] = None) -> Optional[float]:
+        """fair value - (price + taker fee per share); price defaults to the best ask, fair to the model's."""
+        fair = self.fair(outcome) if fair is None else fair
         p = price if price is not None else self.book(outcome).best_ask
         if fair is None or p is None:
             return None
         return fair - (p + self.fee_per_share(p))
 
-    def max_price_for_edge(self, outcome: str, min_edge: float, tick: float = 0.001) -> Optional[float]:
-        """Highest price p (on a `tick` grid) with fair - p - fee(p) >= min_edge, or None."""
-        fair = self.fair(outcome)
+    def max_price_for_edge(self, outcome: str, min_edge: float, tick: float = 0.001,
+                           fair: Optional[float] = None) -> Optional[float]:
+        """Highest price p (on a `tick` grid) with fair - p - fee(p) >= min_edge, or None (fair: model's by default)."""
+        fair = self.fair(outcome) if fair is None else fair
         if fair is None:
             return None
         lo, hi = 1, int(round(MAX_PRICE / tick))

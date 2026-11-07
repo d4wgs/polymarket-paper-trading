@@ -243,7 +243,6 @@ class Engine:
             if self.risk.kill_active:
                 self.maker.cancel(s.name, info.slug)
             equity = broker.equity(self.marks)
-            self.risk.track_equity(s.name, equity, now)
             ctx = TickContext(snap=snap, position=broker.position(snap), cash=broker.cash,
                               equity=equity,
                               fee_theta=broker.current_theta(now, info),
@@ -343,7 +342,8 @@ class Engine:
         except Exception:
             log.exception("Fair value failed for %s", info.slug)
             fv = None
-        basis = (spot - index) / index if spot and index else None
+        # like-for-like basis (the index is a 60s average; see core/fairvalue.py)
+        basis = fv.basis if fv is not None else self.md.basis(now, index)
         self.risk.update_kill(basis, spot, index, now)
         return fv, spot
 

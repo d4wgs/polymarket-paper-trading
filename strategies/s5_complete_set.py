@@ -1,117 +1,133 @@
 """
-S5. COMPLETE-SET ARBITRAGE
+S5. COMPLETE SET, LEGGED IN (v2)
 
-Every tick: what would `n` Up + `n` Down cost, walking the real asks of both books, fees included?
-    cost per set = avg ask Up + avg ask Down + (fee Up + fee Down) / n
-If cost <= 1.00 - min_profit, buy both legs (one set pays exactly $1 at resolution).
+  1. Leg 1: `entry_after_seconds` (15s) into the round, buy whichever side's ask is higher (the
+     favorite; a tie goes to Up). One entry per round.
+  2. Leg 2: buy the exact opposite side, the same number of contracts, on the same market. Once both
+     legs are held, one of them pays $1 at the end whatever happens, so the result is locked in:
+         set cost per contract = leg 1 cost + leg 2 cost   (fees included)
+         profit                = $1 - set cost             (> 0 when the two legs sum to under $1)
+     Leg 2 is bought on a take profit (+`take_profit_pct`, 10%), a stop loss (-`stop_loss_pct`, 5%), or
+     whatever the result is once `exit_seconds_left` (30s) remain (time exit). `pnl_basis` sets what the
+     percentages measure:
+       "price"  (default) leg 1's price move: the price leg 2 implies for leg 1 (1 - leg 2 price) vs
+                what was paid for leg 1, fees left out -- the usual meaning of a TP / SL.
+       "locked" the whole set, fees and spread included: ($1 - set cost) / leg 1 cost. On real
+                Polymarket US books this starts at about -7.5% the moment leg 1 fills (spread + two
+                taker fees), so a 5% stop fires on the first tick in ~9 rounds out of 10 (checked on
+                30 live rounds, 2026-11-07).
+     If leg 2 can't fill (thin book, price moved), it is retried every tick; if the round ends first,
+     leg 1 is held to the result.
 
-Leg risk is simulated honestly: leg 1 (the thinner book) is sent first and filled after the
-latency; leg 2 is sent only then, filled after ANOTHER latency against a freshly fetched book, for
-the shares leg 1 actually got, with a price limit that keeps the pair at break-even
-(leg2_policy "breakeven") -- or at any price (leg2_policy "complete"). If leg 2 doesn't fill,
-leg 1 is simply held to resolution and an `arb_leg2_failed` event is recorded.
+On Polymarket US, Up and Down are ONE contract (Down = the "No" side of Up), so buying the opposite
+leg is executed as selling leg 1 at the Up bid -- the same money: buying Down at 1 - bid is the same as
+selling Up at bid. The trade log records it as a SELL of leg 1 "(buying X closes the Y position)".
 
-Near-misses (cost between 1.00 and 1.01) are logged, at most one per near_miss_log_seconds per
-market, plus a per-window summary (ticks seen, near-misses, opportunities, cheapest cost).
-
-NOTE: On Polymarket US both outcomes are ONE order book (Down ask = 1 - Up bid), so a set always
-costs 1 + spread + fees: this can never trigger there. It is meaningful on polymarket.com, where
-Up and Down are separate books. The near-miss log shows how close it gets.
+Fees: each leg pays the taker fee (0.095 x p x (1-p) per contract at the base tier), so a round trip
+at 50c costs ~4.75c per contract: about 9.5% of a 50c leg 1 before the market moves at all. That is
+already close to the 5% stop. And a leg 1 bought above ~91c can never reach +10% before the round
+ends (it can pay at most $1), so those positions end at the time exit.
 """
-from core.models import UP, DOWN, Order
+from core.models import UP, DOWN
 from strategies.base import MAX_PRICE, Strategy, TickContext
 
 
 class CompleteSetArb(Strategy):
     PARAMS = {
-        "min_profit": 0.005,
-        "near_miss_max_cost": 1.01,
-        "near_miss_log_seconds": 5,
-        "leg2_policy": "breakeven",      # breakeven | complete
-        "stake_usd": 50.0,               # dollars for the whole set (both legs)
+        "entry_after_seconds": 15,      # leg 1 this far into the round
+        "take_profit_pct": 10.0,        # buy leg 2 when the locked profit is >= this % of leg 1's cost
+        "stop_loss_pct": 5.0,           # ... or the locked loss is >= this %
+        "exit_seconds_left": 30,        # ... or this few seconds are left (time exit)
+        "pnl_basis": "price",           # price = leg 1 price move | locked = set result incl. fees + spread
+        "stake_usd": 50.0,              # dollars for leg 1 (risk.max_usd_per_trade caps it too)
         "stake_fraction": None,
-        "skip_last_seconds": 5,
     }
 
-    def __init__(self, *a, **kw):
-        super().__init__(*a, **kw)
-        self._win: dict[str, dict] = {}          # asset -> this window's counters
-        self._late_events: dict[str, list] = {}  # asset -> events produced by leg callbacks
+    @staticmethod
+    def _other(side):
+        return DOWN if side == UP else UP
 
-    def on_window_start(self, ctx: TickContext):
-        prev = self._win.get(ctx.asset)
-        if prev and prev["ticks"]:
-            ctx.event("arb_window_summary", **prev)
-        self._win[ctx.asset] = {"slug": ctx.snap.market.slug, "ticks": 0, "near_misses": 0,
-                                "opportunities": 0, "min_cost": None}
+    @staticmethod
+    def entry_price(ctx: TickContext, all_in: float) -> float:
+        """Leg 1's price without its fee: solves all_in = e + theta * e * (1 - e) for e."""
+        th = ctx.fee_theta or 0.0
+        if th <= 0:
+            return all_in
+        b = 1 + th
+        return (b - (b * b - 4 * th * all_in) ** 0.5) / (2 * th)
+
+    def locked_result(self, ctx: TickContext, held: str, shares: float):
+        """
+        Buying `shares` of the opposite side right now, walking its real asks:
+        (P&L % per pnl_basis, set cost per contract, leg 2 avg price) -- None if the book can't fill it.
+        """
+        c1 = ctx.position.avg_cost(held)                 # leg 1 cost per contract, fees included
+        got, avg2, fee2 = ctx.walk_cost(self._other(held), shares)
+        if not c1 or avg2 is None or got < shares - 1e-6:
+            return None
+        set_cost = c1 + avg2 + fee2 / shares
+        if self.p["pnl_basis"] == "locked":
+            pct = (1.0 - set_cost) / c1 * 100.0
+        else:
+            e = self.entry_price(ctx, c1)
+            pct = ((1.0 - avg2) - e) / e * 100.0          # leg 1's price implied by leg 2, vs entry
+        return pct, set_cost, avg2
+
+    def tp_limit(self, ctx: TickContext, held: str):
+        """Highest leg 2 price that still keeps the take-profit (so latency can't turn it into less)."""
+        c1 = ctx.position.avg_cost(held)
+        tp = self.p["take_profit_pct"] / 100.0
+        if self.p["pnl_basis"] != "locked":
+            lim = 1.0 - self.entry_price(ctx, c1) * (1 + tp)
+            return round(int(lim * 1000 + 1e-9) / 1000, 3) if lim >= 0.001 else None
+        target = 1.0 - c1 * (1 + tp)
+        best, p = None, 0.001
+        while p <= MAX_PRICE + 1e-9:
+            if p + ctx.fee_per_share(p) <= target + 1e-12:
+                best = p
+            p = round(p + 0.001, 3)
+        return best
 
     def on_tick(self, ctx: TickContext):
-        for kind, data in self._late_events.pop(ctx.asset, []):
-            ctx.event(kind, **data)
-        w = self._win.setdefault(ctx.asset, {"slug": ctx.snap.market.slug, "ticks": 0, "near_misses": 0,
-                                             "opportunities": 0, "min_cost": None})
+        if ctx.position.up > 1e-9 and ctx.position.down > 1e-9:
+            return []                    # two-book exchange (polymarket.com): the set is complete, hold it
+        held = UP if ctx.position.up > 1e-9 else (DOWN if ctx.position.down > 1e-9 else None)
+
+        # ---- leg 2: close the set
+        if held is not None:
+            shares = ctx.position.shares(held)
+            other = self._other(held)
+            res = self.locked_result(ctx, held, shares)
+            time_exit = ctx.seconds_left <= self.p["exit_seconds_left"]
+            if res is None:
+                if time_exit and ctx.book(other).best_ask is not None:
+                    return [ctx.buy(other, shares=shares, reason="leg 2 (time exit, thin book)", exit="time")]
+                return []
+            pct, set_cost, avg2 = res
+            why = (f"leg 2 {other} at {avg2:.3f}: {pct:+.1f}% ({self.p['pnl_basis']}), "
+                   f"set cost {set_cost:.4f} incl. fees")
+            if pct >= self.p["take_profit_pct"]:
+                limit = self.tp_limit(ctx, held)
+                if limit is not None:
+                    return [ctx.buy(other, shares=shares, max_price=limit, reason=f"leg 2 take profit: {why}",
+                                    exit="take_profit", locked_pct=round(pct, 2))]
+            if pct <= -self.p["stop_loss_pct"]:
+                return [ctx.buy(other, shares=shares, reason=f"leg 2 stop loss: {why}",
+                                exit="stop_loss", locked_pct=round(pct, 2))]
+            if time_exit:
+                return [ctx.buy(other, shares=shares, reason=f"leg 2 time exit ({ctx.seconds_left:.0f}s left): {why}",
+                                exit="time", locked_pct=round(pct, 2))]
+            return []
+
+        # ---- leg 1: the more expensive side, once per round
+        if ctx.entries_this_window > 0:
+            return []
+        if ctx.seconds_elapsed < self.p["entry_after_seconds"] or ctx.seconds_left <= self.p["exit_seconds_left"]:
+            return []
         a_up, a_dn = ctx.up.best_ask, ctx.down.best_ask
         if a_up is None or a_dn is None:
             return []
-        target = self.stake_usd(ctx) / (a_up + a_dn)
-        got_u, _, _ = ctx.walk_cost(UP, target)
-        got_d, _, _ = ctx.walk_cost(DOWN, target)
-        n = int(min(target, got_u, got_d) * 100) / 100.0
-        if n <= 0:
-            return []
-        _, avg_u, fee_u = ctx.walk_cost(UP, n)
-        _, avg_d, fee_d = ctx.walk_cost(DOWN, n)
-        cost = avg_u + avg_d + (fee_u + fee_d) / n
-        w["ticks"] += 1
-        w["min_cost"] = cost if w["min_cost"] is None else min(w["min_cost"], cost)
-        if 1.0 < cost <= self.p["near_miss_max_cost"]:
-            w["near_misses"] += 1
-            if ctx.ts - ctx.state.get("last_near_miss", 0) >= self.p["near_miss_log_seconds"]:
-                ctx.state["last_near_miss"] = ctx.ts
-                ctx.event("arb_near_miss", cost=round(cost, 5), ask_up=a_up, ask_down=a_dn, shares=n)
-        if cost > 1.0 - self.p["min_profit"] or ctx.seconds_left < self.p["skip_last_seconds"]:
-            return []
-        w["opportunities"] += 1
-        # leg 1 = the thinner book (the one more likely to vanish)
-        depth = {UP: sum(s for _, s in ctx.up.asks), DOWN: sum(s for _, s in ctx.down.asks)}
-        leg1 = UP if depth[UP] <= depth[DOWN] else DOWN
-        leg2 = DOWN if leg1 == UP else UP
-        worst1 = max(p for p, _ in (ctx.up.asks if leg1 == UP else ctx.down.asks)[:10])
-        fee_ps = ctx.fee_per_share
-        asset, policy = ctx.asset, self.p["leg2_policy"]
-
-        def after_leg1(fills):
-            f = [x for x in fills if x.outcome == leg1 and x.side == "BUY"]
-            sh = sum(x.shares for x in f)
-            if sh <= 0:
-                self._late_events.setdefault(asset, []).append(("arb_leg1_unfilled", {"cost_seen": cost}))
-                return None
-            c1 = sum(x.usd + x.fee for x in f) / sh
-            if policy == "complete":
-                limit = MAX_PRICE
-            else:   # highest leg-2 price that still makes the set break even after fees
-                limit, p = None, 0.001
-                while p <= MAX_PRICE + 1e-9:
-                    if c1 + p + fee_ps(p) <= 1.0 + 1e-12:
-                        limit = p
-                    p = round(p + 0.001, 3)
-            if limit is None:
-                self._late_events.setdefault(asset, []).append(
-                    ("arb_leg2_failed", {"why": "no break-even price", "leg1_cost": c1, "shares": sh}))
-                return None
-
-            def after_leg2(fills2):
-                got = sum(x.shares for x in fills2 if x.side in ("BUY", "SELL"))
-                if got < sh - 1e-6:
-                    self._late_events.setdefault(asset, []).append(
-                        ("arb_leg2_failed", {"why": "book moved during latency", "leg1_cost": c1,
-                                             "leg1_shares": sh, "leg2_shares": got, "leg2_limit": limit}))
-                else:
-                    self._late_events.setdefault(asset, []).append(
-                        ("arb_completed", {"leg1_cost": c1, "shares": sh, "cost_seen": cost}))
-                return None
-            return Order(leg2, "BUY", shares=sh, limit=limit, reason=f"arb leg 2 (leg 1 cost {c1:.4f})",
-                         then=after_leg2, meta={"arb_leg": 2, "cost_seen": cost})
-
-        return [ctx.buy(leg1, shares=n, max_price=worst1, reason=f"arb leg 1: set cost {cost:.4f}",
-                        then=after_leg1, arb_leg=1, cost_seen=cost)]
+        side = UP if a_up >= a_dn else DOWN
+        ask = a_up if side == UP else a_dn
+        return [ctx.buy(side, usd=self.stake_usd(ctx),
+                        reason=f"leg 1: {side} is the pricier side ({ask:.3f} vs {min(a_up, a_dn):.3f})")]

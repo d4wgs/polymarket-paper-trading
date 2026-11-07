@@ -12,6 +12,17 @@ A3. Fair-value model, and the market-data hub every strategy reads it from.
 MarketData collects, per tick: spot (fast exchange), oracle (settlement index), the basis between
 them, sigma, and each market's K; and it keeps the oracle's price history so K can be recovered when
 the exchange doesn't publish it.
+
+THE ORACLE IS A 60-SECOND AVERAGE (measured 2026-11-07). Polymarket US's 1-second "BRTI" series
+(/v1/asset-prices/history, tickCount = 60 on every candle) is the trailing 60s average of BRTI -- the
+same quantity the round settles on -- and each round's published K equals that series at the window
+start. That is why it looked ~30s behind spot. Consequences handled here:
+  * basis is measured like for like: mean(spot over the last 60s) / oracle - 1. Comparing the
+    instantaneous spot with the 60s average (what this used to do) mostly measured recent price
+    movement, not a feed disagreement (sd 1.24 bps vs 0.28 bps like for like) and tripped the kill
+    switch on ordinary fast moves.
+  * with S = spot (model.s_source: spot), K is moved into spot's terms, K x (1 + basis), so a steady
+    Coinbase-vs-BRTI offset (~ -0.4 bps, about $3) isn't read as the price being above/below K.
 """
 from __future__ import annotations
 
@@ -91,9 +102,10 @@ class FairValue:
     z: float              # ln(S/K) / (sigma sqrt t)
     spot: Optional[float] = None
     oracle: Optional[float] = None
-    basis: Optional[float] = None       # (spot - oracle) / oracle, None if either is missing
+    basis: Optional[float] = None       # like-for-like spot/oracle basis (see module doc), None if unknown
     s_source: str = "oracle"            # which price S came from
     k_source: str = "exchange"          # exchange (published) / oracle (first index print) / spot
+    k_model: Optional[float] = None     # K as used by the model (in S's terms: K x (1 + basis) for spot)
 
     def of(self, outcome: str) -> float:
         return self.p_up if outcome == "UP" else self.p_down
@@ -203,6 +215,9 @@ class MarketData:
         self.s_source = cfg.get("s_source", "oracle")                   # oracle | spot (other = fallback)
         self.avg_seconds = float(cfg.get("settlement_average_seconds", 0) or 0)
         self.require_published_k = bool(cfg.get("require_published_k", False))
+        # the served index is a trailing average over this many seconds (0/1 = an instantaneous price)
+        self.oracle_avg_seconds = float(cfg.get("oracle_average_seconds", self.avg_seconds) or 0)
+        self.basis_adjust = bool(cfg.get("basis_adjust", True))
         self.oracle = OracleHistory()
         self.markets: dict[str, object] = {}                     # slug -> MarketInfo
         self.last: dict[str, FairValue] = {}                     # slug -> latest fair value
@@ -230,11 +245,23 @@ class MarketData:
         return self.spot.sigma() if self.spot is not None else None
 
     def basis(self, now: float, oracle: Optional[float] = None) -> Optional[float]:
-        spot = self.spot_now(now)
+        """
+        (spot - oracle) / oracle, like for like: when the oracle is a trailing average, spot is averaged
+        over the same seconds. None if either feed is missing or there isn't enough spot history yet.
+        """
         oracle = oracle if oracle is not None else self.oracle.at(now)
-        if not spot or not oracle:
+        if not oracle:
             return None
-        return (spot - oracle) / oracle
+        A = int(round(self.oracle_avg_seconds))
+        if A <= 1:
+            spot = self.spot_now(now)
+            return (spot - oracle) / oracle if spot else None
+        if self.spot_now(now) is None:
+            return None
+        px = [p for p in (self.spot_at(now - i) for i in range(A)) if p]
+        if len(px) < 0.75 * A:
+            return None
+        return (sum(px) / len(px) - oracle) / oracle
 
     def window_open(self, info) -> tuple[Optional[float], str]:
         """K: the exchange's published open price, else the first oracle print of the window, else spot."""
@@ -278,18 +305,20 @@ class MarketData:
         sigma = self.sigma()
         if not S or not K or not sigma:
             return None
+        basis = self.basis(now, oracle)
+        # K is a BRTI (oracle) value; when S is spot, express K in spot's terms too
+        k_model = K * (1 + basis) if (s_src == "spot" and self.basis_adjust and basis is not None) else K
         t = max(info.window_end - now, self.min_t)
         if self.avg_seconds > 0:
             p_up, p_down, z = fair_value_averaged(
-                S, K, sigma, t, self.avg_seconds, self._observed_mean(info, now, s_src),
+                S, k_model, sigma, t, self.avg_seconds, self._observed_mean(info, now, s_src),
                 sigma_multiplier=self.sigma_multiplier, dist=self.dist, df=self.df, min_t=self.min_t)
         else:
-            p_up, p_down, z = fair_value(S, K, sigma, t, sigma_multiplier=self.sigma_multiplier,
+            p_up, p_down, z = fair_value(S, k_model, sigma, t, sigma_multiplier=self.sigma_multiplier,
                                          dist=self.dist, df=self.df, min_t=self.min_t)
         fv = FairValue(p_up=p_up, p_down=p_down, sigma=sigma * self.sigma_multiplier, t=t, S=S, K=K, z=z,
-                       spot=spot, oracle=oracle,
-                       basis=(spot - oracle) / oracle if spot and oracle else None,
-                       s_source=s_src, k_source=k_src)
+                       spot=spot, oracle=oracle, basis=basis,
+                       s_source=s_src, k_source=k_src, k_model=k_model)
         self.last[info.slug] = fv
         return fv
 

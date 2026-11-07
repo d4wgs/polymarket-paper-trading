@@ -220,7 +220,7 @@ class MakerTests(unittest.TestCase):
 class RiskTests(unittest.TestCase):
     def test_limits(self):
         r = RiskManager({"max_usd_per_trade": 50, "max_usd_per_market": 80, "max_open_markets": 2,
-                         "daily_loss_stop": 100, "basis_kill_pct": 0.05})
+                         "basis_kill_pct": 0.05})
         kw = dict(price=0.5, open_markets=0, in_this_market=False, equity=1000)
         self.assertEqual(r.check_buy("s", usd=200, shares=None, market_cost=0, **kw).usd, 50)
         self.assertEqual(r.check_buy("s", usd=200, shares=None, market_cost=60, **kw).usd, 20)
@@ -228,9 +228,9 @@ class RiskTests(unittest.TestCase):
         self.assertEqual(r.check_buy("s", usd=None, shares=500, market_cost=0, **kw).shares, 100)
         self.assertFalse(r.check_buy("s", usd=10, shares=None, market_cost=0, price=0.5, open_markets=2,
                                      in_this_market=False, equity=1000).ok)
-        r.track_equity("s", 1000, 1_790_000_000)
-        self.assertFalse(r.check_buy("s", usd=10, shares=None, market_cost=0, price=0.5, open_markets=0,
-                                     in_this_market=False, equity=899).ok)
+        # no daily loss stop: a big loss today doesn't block new trades (only the $200 equity stop does)
+        self.assertTrue(r.check_buy("s", usd=10, shares=None, market_cost=0, price=0.5, open_markets=0,
+                                    in_this_market=False, equity=250).ok)
 
     def test_kill_switch(self):
         r = RiskManager({"basis_kill_pct": 0.05})

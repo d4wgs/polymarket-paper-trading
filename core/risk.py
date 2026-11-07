@@ -2,23 +2,23 @@
 A7. Risk limits. Checked by the engine before any order that ADDS risk (buys and maker bids);
 exits (sells, and buys that close an opposite position) are never blocked.
 
-Global limits (config `risk:`), applied to each strategy's own paper account:
+Global limits (config `risk:`), applied to each strategy's own paper account. (There is no daily
+loss stop: a strategy stops for good when its portfolio value falls to portfolio.stop_equity -- see
+Engine._check_stop.)
   max_usd_per_trade        clip every new buy to this many dollars
   max_usd_per_market       cost basis held in one round can't exceed this
   max_open_markets         rounds with an open position at the same time
-  daily_loss_stop          once today's loss (ET day, equity vs. start of day) reaches this, no new risk today
-  basis_kill_pct           kill switch: |spot - oracle| / oracle above this blocks all new risk and pulls
+  basis_kill_pct           kill switch: |spot - oracle| / oracle (like for like: spot averaged over
+                           the oracle's 60s averaging window) above this blocks all new risk and pulls
                            every maker quote (default 0.05%)
   require_both_feeds       treat a missing spot or oracle price as a tripped kill switch
 """
 from __future__ import annotations
 
-import datetime as dt
 import logging
 from dataclasses import dataclass
 from typing import Optional
 
-from core.fees import ET
 
 log = logging.getLogger("risk")
 
@@ -37,10 +37,8 @@ class RiskManager:
         self.max_trade = cfg.get("max_usd_per_trade")
         self.max_market = cfg.get("max_usd_per_market")
         self.max_open = cfg.get("max_open_markets")
-        self.daily_loss = cfg.get("daily_loss_stop")
         self.basis_kill = cfg.get("basis_kill_pct", 0.05)
         self.require_both = bool(cfg.get("require_both_feeds", True))
-        self.day_start: dict[str, tuple[dt.date, float]] = {}       # strategy -> (ET day, equity at start)
         self.kill_active = False
         self._kill_logged = 0.0
 
@@ -60,18 +58,6 @@ class RiskManager:
         self.kill_active = tripped
         return tripped
 
-    # ------------------------------------------------------------- daily loss
-    def track_equity(self, strategy: str, equity: float, now: float):
-        day = dt.datetime.fromtimestamp(now, ET).date()
-        cur = self.day_start.get(strategy)
-        if cur is None or cur[0] != day:
-            self.day_start[strategy] = (day, equity)
-
-    def daily_stopped(self, strategy: str, equity: float) -> bool:
-        if self.daily_loss is None or strategy not in self.day_start:
-            return False
-        return self.day_start[strategy][1] - equity >= self.daily_loss
-
     # ------------------------------------------------------------- per order
     def check_buy(self, strategy: str, *, usd: Optional[float], shares: Optional[float], price: Optional[float],
                   market_cost: float, open_markets: int, in_this_market: bool, equity: float) -> RiskDecision:
@@ -81,8 +67,6 @@ class RiskManager:
         """
         if self.kill_active:
             return RiskDecision(False, reason="kill switch (basis / feed)")
-        if self.daily_stopped(strategy, equity):
-            return RiskDecision(False, reason=f"daily loss stop (${self.daily_loss:,.0f})")
         if self.max_open is not None and not in_this_market and open_markets >= self.max_open:
             return RiskDecision(False, reason=f"max open markets ({self.max_open})")
         px = price if price and price > 0 else 1.0

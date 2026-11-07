@@ -222,6 +222,175 @@ with st.sidebar.expander("Glossary"):
         "- **Stopped**: the strategy's portfolio value fell to the stop level, so it no longer trades.")
 
 
+# ---------------------------------------------------------------- live market window (BTC chart + order book)
+BID_COLOR, ASK_COLOR = ("#199e70", "#e66767") if DARK else ("#1baf7a", "#e34948")
+MARKET_REFRESH = 2        # seconds; the bot records a snapshot + book about every 2s
+
+
+@st.cache_data(ttl=MARKET_REFRESH, show_spinner=False, max_entries=8)
+def load_market_view(path, asset, version):
+    """The current round of `asset`: its price path, the round's terms and the latest order book."""
+    import sqlite3
+    con = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
+    try:
+        last = con.execute("SELECT slug FROM snapshots WHERE asset = ? ORDER BY ts DESC LIMIT 1", (asset,)).fetchone()
+        if not last:
+            return None
+        slug = last[0]
+        cols = [r[1] for r in con.execute("PRAGMA table_info(snapshots)")]
+        want = [c for c in ("ts", "seconds_left", "spot", "index_price", "price_to_beat", "k", "up_bid", "up_ask",
+                            "fv_up") if c in cols]
+        snaps = pd.read_sql_query(f"SELECT {', '.join(want)} FROM snapshots WHERE slug = ? ORDER BY ts", con,
+                                  params=(slug,))
+        book = con.execute("SELECT ts, seconds_left, up_bids, up_asks FROM books WHERE asset = ? "
+                           "ORDER BY ts DESC LIMIT 1", (asset,)).fetchone()
+        try:
+            win = con.execute("SELECT window_start, window_end, price_to_beat FROM windows WHERE slug = ?",
+                              (slug,)).fetchone()
+        except sqlite3.OperationalError:      # older databases have no windows table
+            win = None
+    finally:
+        con.close()
+    for c in ("spot", "index_price", "price_to_beat", "k", "fv_up"):
+        if c not in snaps:
+            snaps[c] = np.nan
+    snaps["time"] = pd.to_datetime(snaps["ts"], unit="s", utc=True).dt.tz_convert(metrics.TZ)
+    window_s = next((m["window_seconds"] for m in config.MARKETS if m["asset"] == asset), 300)
+    if win:
+        w_start, w_end, ptb = win
+    else:
+        w_end = float((snaps["ts"] + snaps["seconds_left"]).iloc[-1])
+        w_start, ptb = w_end - window_s, None
+    ptb = ptb or (snaps["price_to_beat"].dropna().iloc[-1] if snaps["price_to_beat"].notna().any() else None)
+    out = {"slug": slug, "snaps": snaps, "start": w_start, "end": w_end, "ptb": ptb, "book": None}
+    if book:
+        out["book"] = {"ts": book[0], "seconds_left": book[1], "bids": json.loads(book[2] or "[]"),
+                       "asks": json.loads(book[3] or "[]")}
+    return out
+
+
+def _et(ts):
+    return pd.Timestamp(ts, unit="s", tz="UTC").tz_convert(metrics.TZ)
+
+
+def market_panel(asset):
+    """BTC price for the current round (with the price to beat) and the round's live order book."""
+    v = load_market_view(db, asset, _db_version(db))
+    if v is None or not len(v["snaps"]):
+        st.caption(f"No data for {market_of(asset)} yet. Is the bot running?")
+        return
+    s, ptb, now = v["snaps"], v["ptb"], time.time()
+    last = s.iloc[-1]
+    left = max(0.0, v["end"] - now)
+    idx = last["index_price"] if pd.notna(last["index_price"]) else None
+    spot = last["spot"] if pd.notna(last["spot"]) else None
+    up_mid = (last["up_bid"] + last["up_ask"]) / 2 if pd.notna(last["up_bid"]) and pd.notna(last["up_ask"]) else None
+
+    a, b, c, e, f = st.columns(5)
+    a.metric("BTC index", f"${idx:,.2f}" if idx else "—", border=True,
+             help="CF Benchmarks BRTI as Polymarket US serves it: a trailing 60-second average, the same "
+                  "quantity the round settles on (and what Polymarket's own chart shows).")
+    b.metric("Price to beat", f"${ptb:,.2f}" if ptb else "—",
+             (f"{idx - ptb:+,.2f} now" if idx and ptb else None), border=True,
+             help="The round's open value. Up wins if the close (the 60s average at the end) is at or above it.")
+    c.metric("Coinbase spot", f"${spot:,.2f}" if spot else "—", border=True,
+             help="The fast feed the model uses. It leads the index by ~30s because the index is a 60s average.")
+    e.metric("Up price (mid)", f"{up_mid:.3f}" if up_mid is not None else "—",
+             (f"model {last['fv_up']:.3f}" if pd.notna(last["fv_up"]) else None), delta_color="off",
+             delta_arrow="off", border=True,
+             help="Market mid for Up; the delta shows the bot's fair-value model for comparison.")
+    f.metric("Time left", f"{int(left // 60)}:{int(left % 60):02d}", border=True,
+             help=f"Round {_et(v['start']):%H:%M}–{_et(v['end']):%H:%M} ET.")
+
+    x0, x1 = _et(v["start"]), _et(v["end"])
+    g1, g2 = st.columns([3, 2])
+    with g1:
+        fig = go.Figure()
+        if s["spot"].notna().any():
+            fig.add_trace(go.Scatter(x=s["time"], y=s["spot"], mode="lines", name="Coinbase spot",
+                                     line=dict(color=PALETTE[1], width=1.5)))
+        if s["index_price"].notna().any():
+            fig.add_trace(go.Scatter(x=s["time"], y=s["index_price"], mode="lines", name="BTC index (60s avg)",
+                                     line=dict(color=PALETTE[0], width=2.5)))
+        if ptb:
+            fig.add_hline(y=ptb, line_dash="dash", line_color=MUTED, line_width=1.5,
+                          annotation_text=f"Price to beat ${ptb:,.2f}", annotation_position="top left",
+                          annotation_font_color=MUTED)
+        fig.update_xaxes(range=[x0, x1])
+        fig.update_yaxes(tickprefix="$", tickformat=",.0f")
+        chart(style(fig, 330, "BTC (USD)"), f"btc_{asset}")
+    with g2:
+        fig = go.Figure()
+        um = s[["up_bid", "up_ask"]].mean(axis=1)
+        fig.add_trace(go.Scatter(x=s["time"], y=um, mode="lines", name="Up price (mid)",
+                                 line=dict(color=PALETTE[0], width=2)))
+        if s["fv_up"].notna().any():
+            fig.add_trace(go.Scatter(x=s["time"], y=s["fv_up"], mode="lines", name="Model fair value",
+                                     line=dict(color=PALETTE[3], width=1.5, dash="dot")))
+        fig.add_hline(y=0.5, line_dash="dot", line_color=MUTED, line_width=1)
+        fig.update_xaxes(range=[x0, x1])
+        fig.update_yaxes(range=[0, 1])
+        chart(style(fig, 330, "Probability of Up"), f"upprob_{asset}")
+
+    bk = v["book"]
+    st.markdown("**Order book** · Up (YES) contract"
+                + (f" · as of {_et(bk['ts']):%H:%M:%S} ET" if bk else ""))
+    if not bk or not (bk["bids"] or bk["asks"]):
+        st.caption("No order book recorded for this round yet.")
+        return
+    bids = pd.DataFrame(bk["bids"], columns=["price", "size"])
+    asks = pd.DataFrame(bk["asks"], columns=["price", "size"])
+    for t in (bids, asks):
+        t["value"] = t["price"] * t["size"]
+        t["cum_size"] = t["size"].cumsum()
+    best_bid = bids["price"].max() if len(bids) else None
+    best_ask = asks["price"].min() if len(asks) else None
+    if best_bid is not None and best_ask is not None:
+        st.caption(f"Spread {best_ask - best_bid:.3f} · Down is the mirror of this book: Down ask = 1 − Up bid "
+                   f"({1 - best_bid:.3f}), Down bid = 1 − Up ask ({1 - best_ask:.3f}).")
+    fmt = {"price": "{:.3f}", "size": "{:,.0f}", "value": "${:,.0f}", "cum_size": "{:,.0f}"}
+    names = {"price": "Price", "size": "Contracts", "value": st.column_config.Column("$", help="Price × contracts."),
+             "cum_size": st.column_config.Column("Total", help="Contracts from the best price out to this level.")}
+    h = 38 * (max(len(bids), len(asks), 1) + 1) + 4
+    o1, o2, o3 = st.columns([1, 1, 2])
+    with o1:
+        st.markdown(f"<span style='color:{BID_COLOR};font-weight:600'>Bids</span> · buy Up", unsafe_allow_html=True)
+        table(bids[["price", "size", "value", "cum_size"]], fmt, column_config=names, height=h)
+    with o2:
+        st.markdown(f"<span style='color:{ASK_COLOR};font-weight:600'>Asks</span> · sell Up", unsafe_allow_html=True)
+        table(asks[["price", "size", "value", "cum_size"]], fmt, column_config=names, height=h)
+    with o3:
+        fig = go.Figure()
+        if len(bids):
+            fig.add_trace(go.Scatter(x=bids["price"], y=bids["cum_size"], mode="lines", line_shape="hv",
+                                     fill="tozeroy", name="Bids (buy Up)", line=dict(color=BID_COLOR, width=2)))
+        if len(asks):
+            fig.add_trace(go.Scatter(x=asks["price"], y=asks["cum_size"], mode="lines", line_shape="hv",
+                                     fill="tozeroy", name="Asks (sell Up)", line=dict(color=ASK_COLOR, width=2)))
+        fig.update_xaxes(title="Price of Up", tickformat=".2f")
+        fig = style(fig, h, "Cumulative contracts")
+        fig.update_layout(hovermode="closest")
+        chart(fig, f"depth_{asset}")
+
+
+@st.dialog("BTC · live price & order book", width="large")
+def market_window():
+    assets = [m["asset"] for m in config.MARKETS]
+    asset = st.segmented_control("Round", assets, default=assets[0], format_func=market_of,
+                                 key="mw_asset", label_visibility="collapsed") or assets[0]
+    st.fragment(run_every=MARKET_REFRESH)(market_panel)(asset)
+    st.caption(f"What the bot sees: recorded every ~2s from Polymarket US (refreshes every {MARKET_REFRESH}s). "
+               "Close this window to return to the dashboard.")
+
+
+with st.sidebar.container(border=True):
+    st.markdown("**Market**")
+    if st.button("BTC chart & order book", icon=":material/candlestick_chart:", width="stretch",
+                 help="Opens a window with the live BTC price for the current round (with the price to beat) "
+                      "and the round's order book."):
+        market_window()
+
+
 def filtered(d):
     d = dict(d)
     d["strategies"] = d["strategies"][d["strategies"]["name"].isin(picked)]
@@ -294,15 +463,18 @@ def live_section():
                      Strategy=summ["Strategy"].map(title_of)).sort_values("Total return", ascending=False)
     cols = ["Strategy", "Status", "Trend", "Portfolio value", "Total return", "Realized P&L", "Trades", "Win rate",
             "Avg P&L per trade", "Luck check (t-stat)", "Worst drop", "Profit per $1 bet", "Avg price paid",
-            "Fees", "Fee theta", "Rebates", "Money bet", "Volume traded"]
+            "Fees", "Fee %", "Fee theta", "Rebates", "Money bet", "Volume traded"]
     cc = st.column_config
     table(lb[cols], {
         "Portfolio value": money, "Total return": lambda x: pct(x, signed=True, digits=2),
         "Realized P&L": SIGNED_MONEY, "Trades": "{:,.0f}", "Win rate": pct, "Avg P&L per trade": SIGNED_MONEY,
         "Luck check (t-stat)": "{:.2f}", "Worst drop": lambda x: pct(x, digits=2), "Profit per $1 bet": "{:+.3f}",
         "Avg price paid": "{:.3f}", "Fees": money, "Money bet": "${:,.0f}", "Volume traded": "${:,.0f}",
-        "Fee theta": "{:.4f}", "Rebates": money,
+        "Fee theta": "{:.4f}", "Rebates": money, "Fee %": lambda x: pct(x, digits=1),
     }, column_config={
+        "Fee %": cc.Column("Fee %", help="Fees ÷ dollars traded (buys and sells). Polymarket US charges "
+                                         "Θ × (1 − price) per dollar paid: ~9% on a 5¢ contract, ~1% at 90¢, "
+                                         "and round trips (buy then sell) pay it twice."),
         "Status": cc.Column("Status", help="Stopped = portfolio value hit the stop level; it no longer trades."),
         "Fee theta": cc.Column("Fee Θ", help="Taker fee coefficient on the latest trade (Polymarket US: by 30-day volume tier)."),
         "Rebates": cc.Column("Rebates", help="Taker rebates earned (Polymarket US: from $250k of 30-day volume)."),

@@ -173,6 +173,9 @@ def leaderboard(d: dict[str, pd.DataFrame]) -> pd.DataFrame:
             "Edge per $1 bought": pnl.sum() / bought_settled if bought_settled > 0 else float("nan"),
             "Avg entry price": (buys["usd"].sum() / buys["shares"].sum()) if len(buys) else float("nan"),
             "Fees $": f["fee"].sum() if len(f) else 0.0,
+            # fees per dollar that changed hands (buys and sells). Polymarket's fee is theta x p x (1-p) per
+            # contract, i.e. theta x (1-p) per dollar paid: ~9% on a 5c longshot, ~1% on a 90c favorite.
+            "Fee % of traded": (100 * f["fee"].sum() / f["usd"].sum()) if len(f) and f["usd"].sum() > 0 else float("nan"),
             "Bought $": bought,                                        # dollars spent buying shares
             "Volume $": vol,                    # US: exchange volume definition; intl: bought + sold
             "Fee theta": last_theta,            # taker fee coefficient on the latest fill
@@ -401,6 +404,7 @@ def summary(d) -> pd.DataFrame:
         "Win rate": lb["Win rate %"],
         "Avg P&L per trade": lb["Avg P&L/window $"],
         "Fees": lb["Fees $"],
+        "Fee %": lb["Fee % of traded"],
         "Money bet": lb["Bought $"],
         "Volume traded": lb["Volume $"],
         # extras kept for the optional "advanced" table

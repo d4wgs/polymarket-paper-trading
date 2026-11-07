@@ -22,9 +22,9 @@ Forward-tests six model-driven strategies on **Polymarket US** Bitcoin "Up or Do
 |---|---|
 | `s1_fair_value` | Buys the side whose model fair value beats ask + fee by ≥ 4¢. Skips the first 30s / last 10s. Holds (optional early exit). |
 | `s2_market_maker` | Rests bids on both sides at fair ± 2¢, skewed by inventory; pulls quotes on fast spot moves and in the last 45s. Logs adverse selection. |
-| `s3_sniper` | In the last 60s (5m) / 120s (15m): z ≥ 2.5, winner's ask 0.90–0.98, edge ≥ 1¢, spot/oracle basis < 25% of S−K. |
+| `s3_sniper` | In the last 60s of every 5m and 15m round, buys whichever side is winning (index vs price to beat). No other filters. |
 | `s4_momentum` | Side ≥ 70¢ **and** spot **and** oracle moved its way since the open. Variant **4b** (`variant_4b`, own bankroll, 5m only): 3 one-minute buckets in the same direction → buy at the final minute if ask ≤ 85¢. |
-| `s5_complete_set` | Buys Up + Down when the pair costs ≤ $0.995 after fees (walking real depth); leg 2 is filled after latency on a fresh book. Logs near-misses. |
+| `s5_complete_set` | 15s in, buys the pricier side (leg 1); buys the opposite side (leg 2) once leg 1's price is +10% or −5% (`pnl_basis: price`; `locked` counts fees and spread), or at 30s left. On Polymarket US leg 2 executes as selling leg 1. |
 | `s6_mean_reversion` | Fades a ≥ 12¢ price jump in 10s that fair value didn't confirm; exits at 50% reversion or 60s. 5m only. |
 
 Old strategies (previous winner, last 60s, underdog, scalp) are in [`archive/`](archive/); their history stays in the database and shows on the dashboard as "retired".
@@ -36,12 +36,11 @@ Each strategy has a block under `strategies:` in `config.yaml`:
 ```yaml
   s3_sniper:
     enabled: true               # false = not run at all
-    name: s3_sniper_v1          # the name results are stored under
+    name: s3_sniper_v2          # the name results are stored under
     markets: [5m, 15m]          # which round lengths it trades
     params:
-      z_threshold: 2.5          # any key from the strategy's PARAMS
-      snipe_window: {5m: 60, 15m: 120}   # a param can differ per market length
-      stake_usd: 25
+      snipe_seconds: 60         # any key from the strategy's PARAMS
+      stake_usd: 25             # (a param can also differ per market length: {5m: 10, 15m: 25})
 ```
 
 1. Edit the value. **If you changed logic or parameters, also bump `name`** (e.g. `_v2`), or old and new results blend together (the bot warns you).
@@ -56,7 +55,7 @@ A misspelled parameter stops the bot at startup with the list of valid names. Ot
 | `model` | Vol half-life (300s), `sigma_multiplier`, `distribution: normal | student_t`, `student_t_df`. |
 | `fees` | `model: auto` = Polymarket US's published schedule (below); `placeholder` = `fee_peak × 4p(1−p)` with a startup WARNING. Maker rebate rate (default 0). |
 | `fills` | Taker latency (250 ms), conservative maker queue, adverse-selection horizon (5s). |
-| `risk` | Max $ per trade / per market, max open markets, daily loss stop, basis kill switch (0.05%). |
+| `risk` | Max $ per trade / per market, max open markets, basis kill switch (0.05%). Strategies stop for good at a $200 portfolio value (`portfolio.stop_equity`). |
 | `portfolio` | Bankroll per strategy ($1,000), stop level. |
 | `engine` | Poll interval, retention, CSV export folder, database path. |
 
@@ -94,7 +93,7 @@ Restarting `run.py` resumes cash and open positions from the database. **Raspber
 
 - **The oracle feed is slow, and settlement is an average (measured 2026-11-07).** The BRTI series we can read from Polymarket US trails Coinbase spot by ~30–35 seconds, and the market rules settle on the *average of 60 BRTI prints in the final minute* (K is the same kind of average). So the model uses **spot as S** (`model.s_source: spot`) and **models the 60-second averaging** (`model.settlement_average_seconds: 60`). The spec's original point formula on the oracle is `s_source: oracle`, `settlement_average_seconds: 0` (give strategies new names if you switch). The oracle is still logged every tick and still drives the basis kill switch and the sniper's basis filter, but because of its lag, basis readings during fast moves are mostly delay, not disagreement.
 
-- **Complete-set arbitrage can't fire on Polymarket US.** Up and Down are one order book there (Down ask = 1 − Up bid), so a pair always costs $1 + spread + fees. S5 runs and logs how close it gets; it's only meaningful on polymarket.com (`exchange: polymarket_intl`, where you'd also set `risk.require_both_feeds: false` because the Chainlink oracle isn't wired in).
+- **Up and Down are one order book on Polymarket US** (Down ask = 1 − Up bid), so buying both at the same moment always costs $1 + spread + fees. S5 v2 therefore legs in: its profit comes only from the price moving its way between leg 1 and leg 2.
 - **The book is polled every 2s (REST).** Maker trade-throughs that happen and vanish between polls are missed (understates maker fills); shocks shorter than a poll are invisible to S6.
 - **The oracle (BRTI 1-second candles from Polymarket US) can lag spot by a second or two**, which shows up as basis. If the kill switch trips too often, look at the logged basis before loosening `basis_kill_pct`.
 - **No market impact across ticks.** Paper buys don't move the real book. Keep stakes small relative to displayed depth.
