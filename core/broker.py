@@ -56,6 +56,7 @@ class PaperBroker:
         # Slugs (rounds) this account has traded in and that haven't settled yet. Rebuilt from the
         # database on restart, so strategies can tell "I already traded this round" after a restart.
         self.traded_slugs: set[str] = set()
+        self.entries: dict[str, int] = {}          # slug -> number of BUY fills that opened risk (this round)
 
     # ------------------------------------------------------------ helpers
     def position(self, snap: Snapshot) -> Position:
@@ -220,27 +221,59 @@ class PaperBroker:
         books[other].bids = sorted(_mirror(books[outcome].asks), key=lambda x: -x[0])
         books[other].asks = sorted(_mirror(books[outcome].bids), key=lambda x: x[0])
 
-    def _book_fill(self, outcome, side, filled, fee, theta, reason, snap, pos) -> Fill:
+    def fill_maker(self, outcome: str, shares: float, price: float, snap: Snapshot, rebate_theta: float = 0.0,
+                   reason: str = "") -> list[Fill]:
+        """
+        A resting bid of ours was traded through: buy `shares` of `outcome` at OUR price, no fee
+        (Polymarket makers pay none), plus the configured maker rebate. On a one-instrument market,
+        buying the side opposite to what we hold closes that position first (like execute_many).
+        Shares are capped by available cash.
+        """
+        m = snap.market
+        pos = self.position(snap)
+        held_other = pos.shares(_other(outcome)) if getattr(m, "single_instrument", False) else 0.0
+        close = min(shares, held_other)
+        open_sh = shares - close
+        if open_sh > 1e-9 and open_sh * price > self.cash:
+            open_sh = max(0.0, math.floor(self.cash / price * 100) / 100.0)
+        fills = []
+        if close > 1e-9:
+            rb = abs(rebate_theta) * close * price * (1 - price)
+            fills.append(self._book_fill(_other(outcome), SELL, [(close, round(1 - price, 6))], 0.0, None,
+                                         (reason + " " if reason else "") + f"(maker: buying {outcome} closes "
+                                         f"the {_other(outcome)} position)", snap, pos, liquidity="maker",
+                                         rebate_override=rb))
+        if open_sh > 1e-9:
+            rb = abs(rebate_theta) * open_sh * price * (1 - price)
+            fills.append(self._book_fill(outcome, BUY, [(open_sh, price)], 0.0, None, reason, snap, pos,
+                                         liquidity="maker", rebate_override=rb))
+        return fills
+
+    def _book_fill(self, outcome, side, filled, fee, theta, reason, snap, pos, liquidity="taker",
+                   rebate_override=None) -> Fill:
         sh = sum(c for c, _ in filled)
         notional = sum(c * p for c, p in filled)
-        rebate = fee * self.fees.rebate_pct(snap.ts)
+        rebate = fee * self.fees.rebate_pct(snap.ts) if rebate_override is None else rebate_override
         if side == BUY:
+            self.entries[snap.market.slug] = self.entries.get(snap.market.slug, 0) + 1
             self.cash -= notional + fee
             pos.add_buy(outcome, sh, notional + fee)
         else:
             self.cash += notional - fee
             pos.add_sell(outcome, sh, notional - fee)
-        self.cash += rebate          # Polymarket US pays taker rebates weekly; credited here when earned
-        self.fees.record(snap.ts, side, sh, notional / sh)
+        self.cash += rebate          # Polymarket US pays rebates weekly; credited here when earned
+        if liquidity == "taker":     # taker fee tiers count taker volume only
+            self.fees.record(snap.ts, side, sh, notional / sh)
         self.traded_slugs.add(snap.market.slug)
         m = snap.market
         return Fill(ts=snap.ts, strategy=self.name, asset=m.asset, slug=m.slug, window_end=m.window_end,
                     outcome=outcome, side=side, shares=sh, avg_price=notional / sh, usd=notional, fee=fee,
-                    reason=reason, theta=theta, rebate=rebate)
+                    reason=reason, theta=theta, rebate=rebate, liquidity=liquidity)
 
     def settle(self, slug: str, winner: str, ts: float) -> Optional[Settlement]:
         pos = self.positions.pop(slug, None)
         self.traded_slugs.discard(slug)
+        self.entries.pop(slug, None)
         if pos is None or pos.is_empty():
             return None
         payout = pos.up if winner == UP else pos.down     # each winning share pays $1
@@ -283,6 +316,8 @@ class PaperBroker:
         for f in fills:
             pos = self.positions.setdefault(f["slug"], Position(f["asset"], f["slug"], f["window_end"]))
             if f["side"] == BUY:
+                if f["slug"] not in settled:
+                    self.entries[f["slug"]] = self.entries.get(f["slug"], 0) + 1
                 cost = f["usd"] + f["fee"]
                 self.cash -= cost
                 pos.add_buy(f["outcome"], f["shares"], cost)
@@ -291,7 +326,7 @@ class PaperBroker:
                 self.cash += proceeds
                 pos.add_sell(f["outcome"], f["shares"], proceeds)
             self.cash += f.get("rebate") or 0.0
-            if f["shares"] > 0:
+            if f["shares"] > 0 and (f.get("liquidity") or "taker") == "taker":
                 self.fees.record(f["ts"], f["side"], f["shares"], f["usd"] / f["shares"])
             if f["slug"] not in settled:
                 self.traded_slugs.add(f["slug"])

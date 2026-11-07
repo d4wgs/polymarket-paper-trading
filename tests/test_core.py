@@ -18,10 +18,10 @@ from core.engine import Engine
 from core.metrics import calibration, load, round_trips
 from core.models import BUY, SELL, UP, DOWN, Book, MarketInfo, Order, Snapshot
 from core.storage import Storage
-from strategies.arbitrage import Arbitrage
+from archive.strategies.arbitrage import Arbitrage
 from strategies.base import TickContext
-from strategies.previous_winner import PreviousWinner
-from strategies.scalp import Scalp
+from archive.strategies.previous_winner import PreviousWinner
+from archive.strategies.scalp import Scalp
 
 FEE = 0.07
 
@@ -548,6 +548,89 @@ class PolymarketUSTests(unittest.TestCase):
         self.assertAlmostEqual(f["usd"] + f["fee"], 100.0, delta=0.01)      # 10% of $1,000
         self.assertEqual(f["theta"], 0.095)
         self.assertAlmostEqual(f["fee"] * 100 % 1, 0.0, places=6)           # whole cents
+
+
+class LongRunningTests(unittest.TestCase):
+    """Things that only matter when the bot runs 24/7 for months (Raspberry Pi)."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
+        self.db = os.path.join(self.tmp.name, "t.db")
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def test_every_us_request_bypasses_the_cdn_cache(self):
+        """Cloudflare caches the gateway for 30s (and 'not found' for minutes): each GET must be unique."""
+        from core.polymarket_us import PolymarketUSFeed
+        feed, seen = PolymarketUSFeed(), []
+
+        class Resp:
+            status_code = 200
+
+            def json(self):
+                return {"ok": True}
+
+            def raise_for_status(self):
+                pass
+
+        class Sess:
+            headers = {}
+
+            def get(self, url, params=None, timeout=None):
+                seen.append(dict(params))
+                return Resp()
+
+        feed._local.session = Sess()
+        feed._get("/v1/markets/x/book")
+        feed._get("/v1/asset-prices/history", {"assets": "crypto:btc"})
+        self.assertEqual(len({p["_"] for p in seen}), 2)                 # a different nonce every time
+        self.assertEqual(seen[1]["assets"], "crypto:btc")               # caller's params are kept
+
+    def test_incremental_drawdown_matches_full_scan(self):
+        from core.metrics import DrawdownTracker, max_drawdowns
+        store = Storage(self.db)
+        curve = [1000, 1100, 990, 1050, 1200, 900, 950]
+        tracker = DrawdownTracker(self.db)
+        for i, eq in enumerate(curve):
+            store.log_equity(i, "a", eq, 0.0)
+            store.log_equity(i, "b", 1000 + i, 0.0)
+            store.commit()
+            if i in (2, 4):
+                tracker.update()                       # read part of the history, then the rest later
+        full, inc = max_drawdowns(self.db), tracker.update()
+        self.assertAlmostEqual(inc["a"], full["a"])
+        self.assertAlmostEqual(inc["a"], 900 / 1200 - 1)
+        self.assertAlmostEqual(inc["b"], 0.0)
+        store.db.close()
+
+    def test_old_order_books_are_pruned_and_trades_kept(self):
+        store = Storage(self.db)
+        m = market()
+        for ts in (100, 200, 300, 400):
+            s = snap(ts, book([(0.4, 10)], [(0.5, 10)]), book([(0.5, 10)], [(0.6, 10)]), m)
+            store.log_snapshot(s)
+            store.log_book(s)
+        store.commit()
+        self.assertEqual(store.prune_books(250, batch=1), 1)     # batches: one row at a time
+        self.assertEqual(store.prune_books(250), 1)
+        self.assertEqual([r[0] for r in store.db.execute("SELECT ts FROM books ORDER BY ts")], [300, 400])
+        self.assertEqual(store.db.execute("SELECT COUNT(*) FROM snapshots").fetchone()[0], 4)
+        store.db.close()
+
+    def test_engine_prunes_books_by_config(self):
+        feed, store = FakeFeed(), Storage(self.db)
+        c = cfg(self.db)
+        c.BOOKS_KEEP_DAYS = 1
+        m = market()
+        for ts in (10, 2 * 86400):
+            s = snap(ts, book([(0.4, 10)], [(0.5, 10)]), book([(0.5, 10)], [(0.6, 10)]), m)
+            store.log_book(s)
+        store.commit()
+        eng = Engine(c, [], feed, store, clock=lambda: 2 * 86400 + 5)
+        eng._prune_books(2 * 86400 + 5)
+        self.assertEqual(store.db.execute("SELECT COUNT(*) FROM books").fetchone()[0], 1)
+        store.db.close()
 
 
 if __name__ == "__main__":

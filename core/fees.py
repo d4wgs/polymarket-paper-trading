@@ -17,7 +17,9 @@ POLYMARKET US  (https://docs.polymarket.us/fees -- checked 2026-11-07)
   Volume per fill = contracts × price of the side you received (buy: C×p, sell: C×(1-p)).
   Rounding: to the nearest $0.01, banker's rounding (half to even); on a multi-fill order the
   total can't exceed the rounded cumulative exact fee.
-  Maker rebates are not modelled: every paper order is a taker order.
+  Makers pay no fee. Maker rebates use the same formula with a negative coefficient, by trailing
+  MAKER volume: < $10M none | $10M-49.9M -0.0035 | $50M-199.9M -0.0070 | $200M+ -0.0104, so a paper
+  account earns none; config `fees.maker_rebate_theta` (default 0) can model one anyway.
 
 POLYMARKET (international, polymarket.com)  (https://docs.polymarket.com/trading/fees)
   Fee = C × feeRate × p × (1 - p), crypto feeRate 0.07, rounded to 5 decimals.
@@ -155,9 +157,77 @@ class USFees:
         self._cache.pop(day, None)     # today's tier doesn't change (it uses completed days), but be safe
 
 
+class PlaceholderFees(IntlFees):
+    """
+    Used only when the exchange's schedule can't be confirmed (config fees.model: placeholder):
+        taker_fee_per_share = fee_peak * 4 * p * (1 - p)      (= fee_peak at p = 0.50)
+    No rounding, no tiers.
+    """
+    name = "placeholder"
+
+    def __init__(self, fee_peak: float = 0.0156):
+        self.fee_peak = fee_peak
+
+    def theta(self, ts, market) -> float:
+        return 4 * self.fee_peak
+
+    def fee(self, levels, theta, market) -> float:
+        return sum(theta * c * p * (1 - p) for c, p in levels)
+
+
+# ------------------------------------------------------------------ A4: the spec-level fee function
+def fee(price: float, size: float, side: str = "taker", *, theta: float | None = None,
+        model: str = "polymarket_us", fee_peak: float = 0.0156, maker_rebate_theta: float = 0.0,
+        round_to_cents: bool | None = None) -> float:
+    """
+    Fee in dollars for `size` contracts filled at `price` (0-1). Positive = you pay; negative = rebate.
+      side="taker": Θ × size × p × (1-p)
+                    polymarket_us   Θ = 0.095 unless given (the tier of a new paper account), cents, half-even
+                    polymarket_intl Θ = 0.07 (crypto), 5 decimals
+                    placeholder     Θ = 4 × fee_peak, unrounded
+      side="maker": makers pay nothing; returns -rebate (maker_rebate_theta × size × p × (1-p)).
+    """
+    if not 0.0 <= price <= 1.0:
+        raise ValueError(f"price must be between 0 and 1, got {price}")
+    if size < 0:
+        raise ValueError("size must be >= 0")
+    if side not in ("taker", "maker"):
+        raise ValueError("side must be 'taker' or 'maker'")
+    pq = price * (1.0 - price)
+    if side == "maker":
+        r = abs(maker_rebate_theta) * size * pq
+        return -(round_cents(r) if model == "polymarket_us" else r)
+    if model == "polymarket_us":
+        th = US_TAKER_TIERS[0][1] if theta is None else theta
+        exact = th * size * pq
+        return round_cents(exact) if round_to_cents is not False else exact
+    if model == "polymarket_intl":
+        th = 0.07 if theta is None else theta
+        return round(th * size * pq, 5) if round_to_cents is not False else th * size * pq
+    if model == "placeholder":
+        th = 4 * fee_peak if theta is None else theta
+        return th * size * pq
+    raise ValueError(f"unknown fee model {model!r}")
+
+
+def taker_fee_per_share(price: float, theta: float, exponent: float = 1.0) -> float:
+    """Exact (unrounded) taker fee for one contract: what edge checks subtract from fair value."""
+    return theta * (price * (1.0 - price)) ** exponent
+
+
+def fee_model_name(cfg) -> str:
+    m = getattr(cfg, "FEE_MODEL", "auto") or "auto"
+    if m == "auto":
+        return "polymarket_us" if getattr(cfg, "EXCHANGE", "polymarket_intl") == "polymarket_us" else "polymarket_intl"
+    return m
+
+
 def make_fee_model(cfg):
-    """The fee model for one strategy account, from config.EXCHANGE."""
-    if getattr(cfg, "EXCHANGE", "polymarket_intl") == "polymarket_us":
+    """The fee model for one strategy account, from config (fees.model; 'auto' follows EXCHANGE)."""
+    name = fee_model_name(cfg)
+    if name == "placeholder":
+        return PlaceholderFees(getattr(cfg, "FEE_PEAK", 0.0156))
+    if name == "polymarket_us":
         return USFees(new_account=getattr(cfg, "US_NEW_ACCOUNT", None),
                       theta_override=getattr(cfg, "US_THETA_OVERRIDE", None))
     return IntlFees()

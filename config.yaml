@@ -1,0 +1,198 @@
+# =====================================================================================
+#  ALL bot parameters live in this file. Edit, then restart the bot (python run.py).
+#  config.py only reads this file; nothing is hardcoded elsewhere.
+#
+#  RULE: if you change a strategy's logic or parameters, also change its `name` (e.g. add _v2),
+#  otherwise old and new results blend into one meaningless track record (the bot warns you).
+# =====================================================================================
+
+exchange: polymarket_us          # polymarket_us (polymarket.us) | polymarket_intl (polymarket.com)
+
+# ---------------------------------------------------------------- markets
+# The asset is a config value. Each entry trades that asset's Up/Down rounds of each listed length.
+# To add ETH later: copy the block, change symbol / spot product / index / slug_prefix.
+assets:
+  - symbol: BTC
+    windows: [5m, 15m]                # which round lengths to trade
+    slug_prefix: "btc-updown-{window}" # Polymarket series, e.g. btc-updown-5m
+    index_asset: "crypto:btc"         # settlement reference on Polymarket US (CF Benchmarks BRTI)
+    spot_product: BTC-USD             # Coinbase product (spot.source: coinbase)
+    spot_symbol: btcusdt              # Binance symbol (spot.source: binance / binanceus -> btcusd)
+    fee_rate: 0.07                    # polymarket.com only (crypto); Polymarket US uses the tiers below
+
+# ---------------------------------------------------------------- A1: spot feed
+spot:
+  source: coinbase                    # coinbase | binance | binanceus (binance.com blocks US IPs)
+  stale_seconds: 5                    # a price older than this counts as missing
+  bootstrap_vol_from_candles: true    # seed sigma from the last 5h of 1-minute candles at startup
+
+# ---------------------------------------------------------------- A2 + A3: volatility & fair value
+model:
+  vol_half_life_seconds: 300          # EWMA half-life of 1-second log returns
+  vol_min_samples: 30                 # sigma unavailable until this many returns (unless seeded)
+  sigma_multiplier: 1.0               # > 1 inflates vol for fat-tail safety
+  distribution: normal                # normal | student_t
+  student_t_df: 4                     # degrees of freedom (student_t only; rescaled to unit variance)
+  min_seconds: 1                      # t is floored at this
+  require_published_k: true           # no fair value (no trading) until the exchange publishes K, a few
+                                      # seconds into each round; fallbacks below are only estimates
+  k_fallback_to_oracle: true          # (only if require_published_k is false) K from the oracle's first print
+  # S (the "current" price). The spec uses the settlement oracle. NOTE (measured 2026-11-07): the BRTI
+  # series Polymarket US serves trails Coinbase spot by ~30-35s, so `oracle` makes fair value stale on
+  # fast moves; `spot` uses the fast feed (basis to BRTI is normally ~0.01%).
+  s_source: spot                      # oracle | spot (the other is the fallback)
+  # Market rules: the open (K) and close are each the AVERAGE of 60 BRTI prints in the minute before.
+  # 0 = the spec's point-settlement formula; 60 = model the averaging (matters most in the last ~2 min).
+  settlement_average_seconds: 60
+
+# ---------------------------------------------------------------- A4: fees
+fees:
+  # auto = the exchange's published schedule, confirmed 2026-11-07 at https://docs.polymarket.us/fees:
+  #   taker fee = theta x contracts x p x (1-p), rounded to the cent (half-even); theta by the strategy's
+  #   own 30-day taker volume: 0.095 (<$10k), 0.085, 0.075, 0.0695 ($250k+). Makers pay 0.
+  # placeholder = fee_peak x 4 x p x (1-p) per share (a WARNING is printed at startup).
+  model: auto                         # auto | polymarket_us | polymarket_intl | placeholder
+  fee_peak: 0.0156                    # placeholder only (fee per share at p = 0.50)
+  maker_rebate_theta: 0.0             # Polymarket US maker rebates start at $10M of volume -> 0 here
+  us_new_account: null                # null | "per_strategy" | "YYYY-MM-DD" (7-day 0.0695 onboarding rate)
+  us_theta_override: null             # force one taker theta
+
+# ---------------------------------------------------------------- A5: paper fills
+fills:
+  latency_ms: 250                     # taker orders fill against the book fetched this long AFTER the decision
+  maker_conservative_queue: true      # maker fills: charge the queue ahead of us against trade-through volume
+  adverse_selection_seconds: 5        # record fair value this long after every maker fill
+  extra_slippage: 0.0                 # optional extra cost per share on taker fills (pessimism knob)
+
+# ---------------------------------------------------------------- A7: risk (global; applied per strategy account)
+risk:
+  max_usd_per_trade: 50
+  max_usd_per_market: 100             # cost basis in one round
+  max_open_markets: 4
+  daily_loss_stop: 150                # $ lost since the start of the ET day -> no new risk until tomorrow
+  basis_kill_pct: 0.05                # |spot - oracle| / oracle in PERCENT (0.05 = 0.05%) -> kill switch
+  require_both_feeds: true            # missing spot or oracle price also trips the kill switch
+
+# ---------------------------------------------------------------- portfolio
+portfolio:
+  starting_bankroll: 1000             # each strategy has its own separate paper bankroll
+  stop_equity: 200                    # a strategy stops for good at this portfolio value (null = never)
+
+# ---------------------------------------------------------------- engine
+engine:
+  poll_seconds: 2                     # Polymarket US allows 25 requests/s per IP
+  equity_every_seconds: 5
+  settle_check_seconds: 15
+  settle_warn_seconds: 3600
+  settle_max_lookups: 6
+  provisional_recheck_seconds: 60
+  book_levels_logged: 10
+  books_keep_days: 30                 # null = keep raw order books forever
+  export_dir: data/exports            # daily CSV of all trades: trades_YYYY-MM-DD.csv (ET day)
+  db_path: null                       # null = data/paper_us.db (US) or data/paper.db (intl)
+
+# =====================================================================================
+#  PART B - STRATEGIES. Each one: enabled, its own name / bankroll / markets, and its params.
+#  markets: list of round lengths it trades ([5m, 15m]); omit for all.
+#  stake_usd: dollars per entry (risk.max_usd_per_trade caps it).
+# =====================================================================================
+strategies:
+  s1_fair_value:
+    enabled: true
+    name: s1_fair_value_v1
+    title: "S1 · Fair-value trader"
+    description: "Buys whichever side the model prices at least 4c above the ask (after fees); holds to the end."
+    markets: [5m, 15m]
+    params:
+      min_edge: 0.04
+      skip_first_seconds: 30
+      skip_last_seconds: 10
+      max_entries_per_window: 1
+      stake_usd: 25
+      early_exit: false
+      exit_threshold: 0.03
+
+  s2_market_maker:
+    enabled: true
+    name: s2_market_maker_v1
+    title: "S2 · Market maker"
+    description: "Rests bids on both sides around fair value, skewed by inventory; fills only on trade-through."
+    markets: [5m, 15m]
+    params:
+      half_spread: 0.02
+      skew_per_share: 0.0005
+      requote_threshold: 0.01
+      guard_bps: 5.0
+      guard_cooldown_seconds: 3
+      stop_quoting_seconds: 45
+      skip_first_seconds: 5
+      quote_shares: 20
+      max_imbalance_shares: 100
+
+  s3_sniper:
+    enabled: true
+    name: s3_sniper_v1
+    title: "S3 · End-of-window sniper"
+    description: "In the last minute(s), buys the near-certain side at 90-98c when z >= 2.5 and the feeds agree."
+    markets: [5m, 15m]
+    params:
+      snipe_window: {5m: 60, 15m: 120}
+      z_threshold: 2.5
+      min_ask: 0.90
+      max_ask: 0.98
+      min_edge: 0.01
+      max_basis_frac: 0.25
+      stake_usd: 25
+
+  s4_momentum:
+    enabled: true
+    name: s4_momentum_v1
+    title: "S4 · Crowd-momentum confirmation"
+    description: "Buys a side priced >= 70c when spot and the oracle both moved its way since the open."
+    markets: [5m, 15m]
+    params:
+      min_side_price: 0.70
+      max_entry: 0.90
+      min_edge: null
+      skip_first_seconds: 30
+      skip_last_seconds: 10
+      stake_usd: 25
+    variant_4b:                       # runs as its own strategy with its own bankroll
+      enabled: true
+      name: s4b_minute_buckets_v1
+      title: "S4b · One-minute buckets"
+      description: "5m only: if spot rose (fell) in each of the first 3 minutes, buys Up (Down) at the final minute, ask <= 85c."
+      markets: [5m]
+      params:
+        buckets: 3
+        max_entry: 0.85
+        entry_window_seconds: 10
+        stake_usd: 25
+
+  s5_complete_set:
+    enabled: true
+    name: s5_complete_set_v1
+    title: "S5 · Complete-set arbitrage"
+    description: "Buys Up + Down when both cost <= $0.995 after fees; leg 2 filled after latency. (Never fires on Polymarket US: one book.)"
+    markets: [5m, 15m]
+    params:
+      min_profit: 0.005
+      near_miss_max_cost: 1.01
+      leg2_policy: breakeven
+      stake_usd: 50
+
+  s6_mean_reversion:
+    enabled: true
+    name: s6_shock_reversion_v1
+    title: "S6 · Shock mean reversion"
+    description: "Fades a >= 12c price jump in 10s that fair value didn't confirm; exits at 50% reversion or 60s."
+    markets: [5m]
+    params:
+      shock_size: 0.12
+      shock_lookback: 10
+      max_fair_move: 0.04
+      min_edge: 0.03
+      exit_mode: revert
+      gap_close_frac: 0.5
+      time_stop_seconds: 60
+      stake_usd: 25

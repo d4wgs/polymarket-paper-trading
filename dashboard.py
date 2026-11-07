@@ -21,13 +21,14 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 os.chdir(HERE)
 
+import numpy as np
 import pandas as pd
 import plotly.express as px
 import plotly.graph_objects as go
 import streamlit as st
 
 import config
-from core import metrics
+from core import analytics, metrics
 
 st.set_page_config(page_title="Polymarket Paper Desk", page_icon="📈", layout="wide")
 
@@ -129,9 +130,20 @@ def _db_version(path):
     return tuple(os.path.getmtime(p) if os.path.exists(p) else 0 for p in (path, path + "-wal"))
 
 
+@st.cache_resource(show_spinner=False)
+def _dd_tracker(path, db_id):
+    return metrics.DrawdownTracker(path)     # one per database file, shared by every browser tab
+
+
 @st.cache_data(ttl=60, show_spinner=False)
 def load_max_dd(path, minute):
-    return metrics.max_drawdowns(path)       # whole-history scan: refreshed once a minute is plenty
+    # Only reads equity rows added since the last refresh. db_id changes if the file is replaced
+    # (e.g. deleted and started fresh), which starts a new tracker instead of keeping old peaks.
+    try:
+        db_id = os.stat(path).st_ino or os.stat(path).st_ctime
+    except OSError:
+        db_id = 0
+    return _dd_tracker(path, db_id).update()
 
 
 @st.cache_data(ttl=60, show_spinner=False, max_entries=4)
@@ -405,6 +417,127 @@ def live_section():
 
 
 st.fragment(run_every=LIVE_SECONDS if live else None)(live_section)()
+
+
+# ---------------------------------------------------------------- strategy lab (Part C comparison)
+@st.cache_data(ttl=60, show_spinner=False, max_entries=4)
+def load_lab(path, version):
+    return analytics.load_lab(path)
+
+
+@st.cache_data(ttl=600, show_spinner=False, max_entries=4)
+def load_tick_calibration(path, ten_minutes):
+    return analytics.model_calibration_ticks(path)
+
+
+def strategy_lab():
+    lab = load_lab(db, _db_version(db))
+    bankrolls = dict(zip(d0["strategies"]["name"], d0["strategies"]["bankroll"]))
+    sc = analytics.scorecard(lab, picked, max_dd=load_max_dd(db, int(time.time() // 60)), bankrolls=bankrolls)
+    st.markdown("##### Strategy lab")
+    st.caption("Same live data, separate bankrolls. Edge = model fair value − (price + fee per share). "
+               "Realized edge = (1 if the side won) − (price + fee per share). Breakeven = the hit rate needed "
+               "to break even holding to the result.")
+    if len(sc):
+        show = sc.assign(strategy=sc["strategy"].map(title_of))
+        cc = st.column_config
+        table(show[["strategy", "pnl_after_fees", "pnl_before_fees", "trades", "rounds", "win_rate", "hit_rate",
+                    "breakeven_win_rate", "avg_entry", "avg_edge_entry", "avg_realized_edge", "sharpe", "t_stat",
+                    "max_dd_pct", "fees", "maker_share"]],
+              {"pnl_after_fees": SIGNED_MONEY, "pnl_before_fees": SIGNED_MONEY, "trades": "{:,.0f}",
+               "rounds": "{:,.0f}", "win_rate": lambda x: pct(x * 100), "hit_rate": lambda x: pct(x * 100),
+               "breakeven_win_rate": lambda x: pct(x * 100), "avg_entry": "{:.3f}", "avg_edge_entry": "{:+.3f}",
+               "avg_realized_edge": "{:+.3f}", "sharpe": "{:+.2f}", "t_stat": "{:+.2f}",
+               "max_dd_pct": lambda x: pct(x, digits=2), "fees": money, "maker_share": lambda x: pct(x * 100, digits=0)},
+              column_config={
+                  "strategy": "Strategy", "pnl_after_fees": cc.Column("PnL after fees", help="Settled rounds."),
+                  "pnl_before_fees": cc.Column("PnL before fees"), "trades": cc.Column("Trades", help="Entries (BUY fills)."),
+                  "rounds": cc.Column("Rounds", help="Settled rounds with money in."),
+                  "win_rate": cc.Column("Win %", help="Rounds with positive P&L."),
+                  "hit_rate": cc.Column("Hit %", help="Share of shares bought whose side won."),
+                  "breakeven_win_rate": cc.Column("Breakeven %", help="Avg price + fee per share paid: the hit rate needed to break even."),
+                  "avg_entry": "Avg entry", "avg_edge_entry": cc.Column("Edge at entry", help="Model fair value − (fill price + fee)."),
+                  "avg_realized_edge": cc.Column("Realized edge", help="Outcome (1/0) − (fill price + fee), per share."),
+                  "sharpe": cc.Column("Sharpe/trade", help="Mean ÷ std of round P&L (not annualized)."),
+                  "t_stat": cc.Column("t-stat", help="Under ~2 = can't rule out luck."),
+                  "max_dd_pct": "Max DD", "fees": "Fees", "maker_share": cc.Column("Maker %", help="Share of fills that were maker fills.")})
+    c1, c2 = st.columns(2)
+    with c1:
+        st.caption("Model calibration: fair value of the side traded vs. how often it won. "
+                   "On the dotted diagonal = the model is right. Gray = every logged tick (Up).")
+        cal = analytics.model_calibration({**lab, "fills": lab["fills"][lab["fills"].strategy.isin(picked + ["All trades"])]
+                                           if len(lab["fills"]) else lab["fills"]})
+        ticks = load_tick_calibration(db, int(time.time() // 600))
+        fig = go.Figure()
+        fig.add_trace(go.Scatter(x=[0, 1], y=[0, 1], mode="lines", line=dict(dash="dot", color=MUTED, width=1),
+                                 showlegend=False, hoverinfo="skip"))
+        if len(ticks):
+            fig.add_trace(go.Scatter(x=ticks["avg_fair"], y=ticks["win_rate"], mode="lines+markers", name="All ticks (model)",
+                                     line=dict(color=MUTED, width=1.5), customdata=ticks["ticks"],
+                                     hovertemplate="fair %{x:.2f} → won %{y:.2f} (%{customdata} ticks)<extra></extra>"))
+        if len(cal):
+            for name, g in cal.groupby("strategy"):
+                label = name if name == "All trades" else title_of(name)
+                fig.add_trace(go.Scatter(x=g["avg_fair"], y=g["win_rate"], mode="markers", name=label,
+                                         marker=dict(size=np.clip(np.sqrt(g["trades"]) * 4, 6, 22),
+                                                     color=color_map.get(label, PALETTE[0] if name == "All trades" else None)),
+                                         customdata=np.stack([g["label"], g["trades"]], axis=1),
+                                         hovertemplate="%{customdata[0]}: won %{y:.2f} (%{customdata[1]} trades)<extra>" + label + "</extra>"))
+        fig.update_xaxes(range=[-0.02, 1.02], title_text="Model fair value")
+        fig.update_yaxes(range=[-0.05, 1.05])
+        if len(cal) or len(ticks):
+            chart(style(fig, 320, "Actual win rate").update_layout(hovermode="closest"), "model_cal")
+            if len(cal):
+                tab = cal[cal.strategy == "All trades"][["label", "trades", "avg_fair", "win_rate"]]
+                table(tab, {"trades": "{:,.0f}", "avg_fair": "{:.3f}", "win_rate": "{:.3f}"},
+                      column_config={"label": "Fair value bucket", "trades": "Trades", "avg_fair": "Avg fair",
+                                     "win_rate": "Actual win rate"})
+        else:
+            st.caption("Needs settled trades (or ticks) with a model fair value.")
+    with c2:
+        st.caption("PnL by market (5m vs 15m) and by time left at entry")
+        bk = analytics.pnl_by_kind(lab)
+        bk = bk[bk.strategy.isin(picked)] if len(bk) else bk
+        if len(bk):
+            fig = px.bar(relabel(bk), x="strategy", y="pnl", color="kind", barmode="group",
+                         labels={"pnl": "P&L ($)", "strategy": "", "kind": "Market"},
+                         color_discrete_sequence=[PALETTE[0], PALETTE[1], PALETTE[2]])
+            fig.update_traces(marker_line_width=0, marker_cornerradius=4)
+            chart(style(fig, 220, "P&L ($)").update_layout(hovermode="closest"), "pnl_kind")
+        bt = analytics.pnl_by_time_left(lab)
+        bt = bt[bt.strategy.isin(picked)] if len(bt) else bt
+        if len(bt):
+            order = [b for b in analytics.TIME_LEFT_LABELS if b in set(bt["bucket"])]
+            fig = px.bar(relabel(bt), x="bucket", y="pnl", color="strategy", barmode="group",
+                         category_orders={"bucket": order}, color_discrete_map=color_map,
+                         labels={"pnl": "P&L ($)", "bucket": "Time left at entry", "strategy": "Strategy"})
+            fig.update_traces(marker_line_width=0, marker_cornerradius=4)
+            chart(style(fig, 220, "P&L ($)", legend=False).update_layout(hovermode="closest"), "pnl_tleft")
+        if not len(bk) and not len(bt):
+            st.caption("No settled rounds yet.")
+    adv = analytics.adverse_selection(lab)
+    adv = adv[adv.strategy.isin(picked)] if len(adv) else adv
+    ev = lab["events"]
+    ev = ev[ev.strategy.isin(picked)] if len(ev) else ev
+    c1, c2 = st.columns(2)
+    with c1:
+        st.caption("Maker adverse selection: fair-value move in the 5s after each maker fill (negative = picked off)")
+        if len(adv):
+            table(relabel(adv), {"maker_fills": "{:,.0f}", "avg_fv_move": "{:+.4f}", "adverse_share": lambda x: pct(x * 100)},
+                  column_config={"strategy": "Strategy", "maker_fills": "Maker fills", "avg_fv_move": "Avg FV move",
+                                 "adverse_share": "Share adverse"})
+        else:
+            st.caption("No maker fills yet.")
+    with c2:
+        st.caption("Diagnostics (near-misses, skipped signals, risk rejections, failed legs)")
+        if len(ev):
+            table(relabel(ev).sort_values(["strategy", "n"], ascending=[True, False])[["strategy", "kind", "n"]],
+                  {"n": "{:,.0f}"}, column_config={"strategy": "Strategy", "kind": "Event", "n": "Count"})
+        else:
+            st.caption("No events yet.")
+
+
+strategy_lab()
 
 # ---------------------------------------------------------------- all-time analysis
 d = filtered(d0)

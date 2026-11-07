@@ -7,10 +7,11 @@ Nothing in here talks to the internet or the database. These are just the
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Optional
+from typing import Any, Callable, Optional
 
 UP, DOWN = "UP", "DOWN"
 BUY, SELL = "BUY", "SELL"
+TAKER, MAKER_BID, CANCEL = "taker", "maker_bid", "cancel"     # Order.kind
 
 
 @dataclass
@@ -99,6 +100,8 @@ class Snapshot:
     up: Book
     down: Book
     index_price: Optional[float] = None    # settlement index (US: CF Benchmarks BRTI) at this moment
+    fv: Any = None                         # core.fairvalue.FairValue at this moment (None if unavailable)
+    spot: Optional[float] = None           # fast exchange spot price at this moment
 
     @property
     def seconds_left(self) -> float:
@@ -117,13 +120,26 @@ class Order:
       BUY  + shares=20    -> buy up to 20 shares
       SELL + shares=None  -> sell everything you hold of that outcome
     `limit` = worst price you accept (max for buys, min for sells).
+
+    kind:
+      "taker"     (default) crosses the spread now; filled against the book as it looks after the
+                  configured latency.
+      "maker_bid" rests a bid for `shares` at `limit` (replacing this strategy's bid on that outcome);
+                  filled only when the market trades THROUGH the price (core/maker.py).
+      "cancel"    cancels this strategy's resting bid on `outcome` (or on both if outcome is None).
+    then: optional callable(fills) -> Order | None, run after another latency delay against a freshly
+          fetched book (multi-leg orders, e.g. complete-set arbitrage).
+    meta: extra numbers the strategy wants recorded with the fill (e.g. the signal that fired).
     """
-    outcome: str            # UP or DOWN
+    outcome: Optional[str]  # UP or DOWN (None only for a cancel-all)
     side: str               # BUY or SELL
     usd: Optional[float] = None
     shares: Optional[float] = None
     limit: Optional[float] = None
     reason: str = ""
+    kind: str = TAKER
+    then: Optional[Callable[[list], Optional["Order"]]] = None
+    meta: dict = field(default_factory=dict)
 
 
 @dataclass
@@ -142,6 +158,8 @@ class Fill:
     reason: str = ""
     theta: Optional[float] = None   # taker fee coefficient used
     rebate: float = 0.0             # taker rebate earned on this fill (credited to cash)
+    liquidity: str = "taker"        # taker / maker
+    meta: dict = field(default_factory=dict)   # fair value, edge, spot, oracle, basis, sigma, ...
 
 
 @dataclass

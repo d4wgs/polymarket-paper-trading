@@ -4,8 +4,11 @@ COPY THIS FILE to start a new strategy.
   1. Copy to strategies/my_idea.py and rename the class.
   2. Put every number you might want to tune in PARAMS.
   3. Write your rules in on_tick(). Return a list of orders, or [].
-  4. Add it to STRATEGIES in config.py (you can add the same class several
-     times with different PARAMS to compare settings side by side).
+  4. Register the class in REGISTRY in config.py (one line), then add a block for it under
+     `strategies:` in config.yaml (enabled, name, markets, params). All numbers live in config.yaml.
+
+  The model is available too: ctx.fv (fair value), ctx.edge(side), ctx.max_price_for_edge(side, e),
+  ctx.spot / ctx.oracle / ctx.basis, ctx.md.spot_at(ts). See strategies/base.py for the full list.
 
 Things you can read inside on_tick(ctx):
   ctx.asset                 "BTC-15m" or "BTC-5m" (the label from config.MARKETS)

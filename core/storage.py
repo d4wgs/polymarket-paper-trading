@@ -13,6 +13,10 @@ Tables
   windows     - each round's exchange slug and "price to beat" (Up/Down open value)
   strategy_status - when a strategy hit its stop level and stopped trading (survives restarts)
   meta        - which exchange / fee model this database was recorded with
+  events      - strategy diagnostics that aren't trades (near-misses, failed legs, signals skipped)
+
+Every fill also records the model's view at entry: fair value of the side traded, edge after fees,
+spot, oracle, basis, sigma, seconds left, maker/taker, and (maker fills) the fair value 5s later.
 """
 from __future__ import annotations
 
@@ -45,6 +49,7 @@ CREATE INDEX IF NOT EXISTS ix_books ON books(asset, ts);
 CREATE INDEX IF NOT EXISTS ix_fills_strat ON fills(strategy);
 CREATE INDEX IF NOT EXISTS ix_settle_strat ON settlements(strategy);
 CREATE INDEX IF NOT EXISTS ix_eq_strat ON equity(strategy, ts);
+CREATE INDEX IF NOT EXISTS ix_eq_ts ON equity(ts);                 -- dashboard: last hour / latest row
 CREATE INDEX IF NOT EXISTS ix_snap ON snapshots(asset, ts);
 CREATE INDEX IF NOT EXISTS ix_snap_ts ON snapshots(ts);            -- dashboard: "last hour" query
 CREATE INDEX IF NOT EXISTS ix_snap_slug ON snapshots(slug, ts);    -- dashboard: price path of one round
@@ -57,17 +62,28 @@ CREATE TABLE IF NOT EXISTS windows (
 CREATE TABLE IF NOT EXISTS strategy_status (
     name TEXT PRIMARY KEY, stopped_at REAL, equity REAL, reason TEXT);
 CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT);
+CREATE TABLE IF NOT EXISTS events (
+    ts REAL, strategy TEXT, asset TEXT, slug TEXT, kind TEXT, data TEXT);
+CREATE INDEX IF NOT EXISTS ix_events ON events(strategy, kind, ts);
 """
 
 # columns added after the first release: (table, column, type) -- added to older databases on open
 MIGRATIONS = [
     ("fills", "theta", "REAL"), ("fills", "rebate", "REAL"),
     ("snapshots", "price_to_beat", "REAL"), ("snapshots", "index_price", "REAL"),
+    ("snapshots", "spot", "REAL"), ("snapshots", "basis", "REAL"), ("snapshots", "sigma", "REAL"),
+    ("snapshots", "fv_up", "REAL"), ("snapshots", "k", "REAL"),
+    ("fills", "liquidity", "TEXT"), ("fills", "fair_value", "REAL"), ("fills", "edge", "REAL"),
+    ("fills", "spot", "REAL"), ("fills", "oracle", "REAL"), ("fills", "basis", "REAL"),
+    ("fills", "sigma", "REAL"), ("fills", "seconds_left", "REAL"), ("fills", "fv_after_5s", "REAL"),
+    ("fills", "decision_ts", "REAL"), ("fills", "k", "REAL"), ("fills", "extra", "TEXT"),
 ]
+FILL_META = ("fair_value", "edge", "spot", "oracle", "basis", "sigma", "seconds_left", "decision_ts", "k")
 FILL_COLS = ("ts", "strategy", "asset", "slug", "window_end", "outcome", "side", "shares", "avg_price",
-             "usd", "fee", "reason", "theta", "rebate")
+             "usd", "fee", "reason", "theta", "rebate", "liquidity") + FILL_META + ("extra",)
 SNAP_COLS = ("ts", "asset", "slug", "seconds_left", "up_bid", "up_ask", "down_bid", "down_ask",
-             "up_ask_depth", "down_ask_depth", "price_to_beat", "index_price")
+             "up_ask_depth", "down_ask_depth", "price_to_beat", "index_price", "spot", "basis", "sigma",
+             "fv_up", "k")
 
 
 class Storage:
@@ -127,11 +143,42 @@ class Storage:
                     f"the logic, parameters, bankroll or markets.")
         return None
 
-    def log_fill(self, f: Fill):
-        self.db.execute(f"INSERT INTO fills ({','.join(FILL_COLS)}) VALUES ({','.join('?' * len(FILL_COLS))})",
-                        (f.ts, f.strategy, f.asset, f.slug, f.window_end, f.outcome, f.side,
-                         f.shares, f.avg_price, f.usd, f.fee, f.reason,
-                         getattr(f, "theta", None), getattr(f, "rebate", 0.0)))
+    def log_fill(self, f: Fill) -> int:
+        """Returns the fill's rowid (used to attach the fair value 5s later)."""
+        meta = dict(getattr(f, "meta", None) or {})
+        extra = {k: v for k, v in meta.items() if k not in FILL_META}
+        cur = self.db.execute(
+            f"INSERT INTO fills ({','.join(FILL_COLS)}) VALUES ({','.join('?' * len(FILL_COLS))})",
+            (f.ts, f.strategy, f.asset, f.slug, f.window_end, f.outcome, f.side,
+             f.shares, f.avg_price, f.usd, f.fee, f.reason,
+             getattr(f, "theta", None), getattr(f, "rebate", 0.0), getattr(f, "liquidity", "taker"))
+            + tuple(meta.get(k) for k in FILL_META)
+            + (json.dumps(extra, default=str, separators=(",", ":")) if extra else None,))
+        return cur.lastrowid
+
+    def set_fill_followup(self, rowid: int, fv_after: float):
+        self.db.execute("UPDATE fills SET fv_after_5s=? WHERE rowid=?", (fv_after, rowid))
+
+    def log_event(self, ts, strategy, asset, slug, kind, data: dict):
+        self.db.execute("INSERT INTO events VALUES (?,?,?,?,?,?)",
+                        (ts, strategy, asset, slug, kind, json.dumps(data, default=str, separators=(",", ":"))))
+
+    def export_fills_csv(self, path: str, t0: float, t1: float) -> int:
+        """Write every fill with ts in [t0, t1) (all columns, plus the round's result) to a CSV file."""
+        import csv
+        rows = self.db.execute(
+            "SELECT f.*, r.winner AS round_winner FROM fills f LEFT JOIN resolutions r ON r.slug = f.slug "
+            "WHERE f.ts >= ? AND f.ts < ? ORDER BY f.ts", (t0, t1)).fetchall()
+        os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+        with open(path, "w", newline="", encoding="utf-8") as fh:
+            w = csv.writer(fh)
+            if rows:
+                w.writerow(rows[0].keys())
+            else:
+                w.writerow(list(FILL_COLS) + ["round_winner"])
+            for r in rows:
+                w.writerow(list(r))
+        return len(rows)
 
     def log_settlement(self, s: Settlement):
         d = asdict(s)
@@ -141,11 +188,14 @@ class Storage:
         self.db.execute("INSERT INTO equity VALUES (?,?,?,?,?)", (ts, strategy, cash, open_value, cash + open_value))
 
     def log_snapshot(self, s: Snapshot):
+        fv = getattr(s, "fv", None)
         self.db.execute(f"INSERT INTO snapshots ({','.join(SNAP_COLS)}) VALUES ({','.join('?' * len(SNAP_COLS))})",
                         (s.ts, s.market.asset, s.market.slug, s.seconds_left,
                          s.up.best_bid, s.up.best_ask, s.down.best_bid, s.down.best_ask,
                          s.up.ask_depth_usd(), s.down.ask_depth_usd(),
-                         getattr(s.market, "price_to_beat", None), getattr(s, "index_price", None)))
+                         getattr(s.market, "price_to_beat", None), getattr(s, "index_price", None),
+                         getattr(s, "spot", None), fv.basis if fv else None, fv.sigma if fv else None,
+                         fv.p_up if fv else None, fv.K if fv else None))
 
     def log_book(self, s: Snapshot, depth: int = 10):
         """Full order book (top `depth` levels per side) for every tick, as compact JSON."""
@@ -154,6 +204,20 @@ class Storage:
         self.db.execute("INSERT INTO books VALUES (?,?,?,?,?,?,?,?)",
                         (s.ts, s.market.asset, s.market.slug, s.seconds_left,
                          lv(s.up.bids), lv(s.up.asks), lv(s.down.bids), lv(s.down.asks)))
+
+    def prune_books(self, before_ts: float, batch: int = 20_000) -> int:
+        """
+        Delete raw order-book rows older than `before_ts`, a batch at a time (so the dashboard is
+        never blocked for long). Freed pages are reused by new rows, so the file stops growing once
+        the retention window is full. Top-of-book prices (snapshots), trades and results are kept.
+        """
+        # rows are appended in time order, so the oldest are at the lowest rowids: a rowid-order scan
+        # finds them at once without needing another index on this (large) table
+        cur = self.db.execute(
+            "DELETE FROM books WHERE rowid IN (SELECT rowid FROM books WHERE ts < ? LIMIT ?)",
+            (before_ts, batch))
+        self.db.commit()
+        return cur.rowcount
 
     def log_resolution(self, slug, asset, window_end, winner, official, ts):
         self.db.execute("INSERT OR REPLACE INTO resolutions VALUES (?,?,?,?,?,?)",
@@ -190,6 +254,16 @@ class Storage:
                             (new_winner, payout, pnl, r["rowid"]))
             out.append({"strategy": r["strategy"], "old_payout": r["payout"], "new_payout": payout, "pnl": pnl})
         return out
+
+    def strategies_with_open_bets(self) -> list[str]:
+        """Strategies with fills in a round they have no settlement for yet."""
+        return [r[0] for r in self.db.execute(
+            "SELECT DISTINCT f.strategy FROM fills f WHERE NOT EXISTS "
+            "(SELECT 1 FROM settlements s WHERE s.strategy = f.strategy AND s.slug = f.slug)")]
+
+    def bankroll_of(self, strategy: str):
+        r = self.db.execute("SELECT bankroll FROM strategies WHERE name=?", (strategy,)).fetchone()
+        return r[0] if r else None
 
     def history_for(self, strategy: str) -> tuple[list[dict], list[dict]]:
         fills = [dict(r) for r in self.db.execute("SELECT * FROM fills WHERE strategy=? ORDER BY ts", (strategy,))]

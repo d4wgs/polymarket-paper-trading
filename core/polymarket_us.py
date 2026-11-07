@@ -105,10 +105,20 @@ class PolymarketUSFeed:
         if s is None:
             s = self._local.session = requests.Session()
             s.headers["User-Agent"] = "polymarket-paper-trader/1.0"
+            s.headers["Cache-Control"] = "no-cache"
         return s
 
     def _get(self, path: str, params: Optional[dict] = None):
-        """JSON, or None on 'not found' / failure. The API answers not-found as 404 or {"code": 5}."""
+        """
+        JSON, or None on 'not found' / failure. The API answers not-found as 404 or {"code": 5}.
+
+        The gateway sits behind Cloudflare, which caches responses ("cache-control: public,
+        max-age=30"), including "not found". Without a unique query string the bot would trade on
+        order books up to 30s old, miss the first minutes of every round (the "no book yet" answer
+        from the round's first second stays cached), and learn results minutes late. The `_` nonce
+        makes every request go to the exchange itself (checked Nov 7 2026: cf-cache-status MISS).
+        """
+        params = {**(params or {}), "_": time.time_ns()}
         for attempt in range(self.attempts):
             try:
                 r = self._session().get(f"{GATEWAY}{path}", params=params, timeout=self.timeout)

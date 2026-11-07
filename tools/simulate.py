@@ -23,6 +23,8 @@ os.chdir(HERE)
 
 import config
 from core.engine import Engine
+from core.fairvalue import MarketData
+from core.spot import SimSpot
 from core.models import Book, MarketInfo, UP, DOWN
 from core.polymarket import window_start_for
 from core.storage import Storage
@@ -156,12 +158,21 @@ def main():
 
     cfg = types.SimpleNamespace(**{k: getattr(config, k) for k in dir(config) if k.isupper()})
     cfg.DB_PATH = args.db
+    cfg.EXPORT_DIR = None                     # simulated days must not land in the live CSV folder
     clock = SimClock(start=window_start_for(1_790_000_000, 900))
     feed = SimFeed(clock, cfg.WINDOW_SECONDS, seed=args.seed, us=getattr(cfg, "EXCHANGE", "") == "polymarket_us")
     # fresh strategy objects so a sim never shares state with a live run
     strategies = [type(s)(s.name, assets=s.assets, bankroll=s.bankroll, title=s.title,
                           description=s.description, details=s.details, **s.p) for s in config.STRATEGIES]
-    engine = Engine(cfg, strategies, feed, Storage(args.db), clock=clock.now, sleep=clock.sleep)
+    under = SimFeed.underlying_of(config.MARKETS[0])
+
+    def spot_price(now):
+        feed.windows.setdefault(under, {m["asset"]: m["window_seconds"] for m in config.MARKETS})
+        return feed._advance(under, now)
+    spot = SimSpot(spot_price, half_life=config.MODEL.get("vol_half_life_seconds", 300), seed=args.seed)
+    spot.vol.seed(feed.sig_s)                 # the sim's true vol, so the model works from the first tick
+    md = MarketData(spot, config.MODEL)
+    engine = Engine(cfg, strategies, feed, Storage(args.db), clock=clock.now, sleep=clock.sleep, market_data=md)
     engine.run(max_seconds=args.hours * 3600 + 120)
     engine.settle_finished(clock.now() + 3600)
     engine.record_equity(clock.now())

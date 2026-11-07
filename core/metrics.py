@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import math
 import sqlite3
+import threading
 
 import numpy as np
 import pandas as pd
@@ -32,6 +33,47 @@ def max_drawdowns(db_path: str) -> dict[str, float]:
 def _to_time(ts: pd.Series) -> pd.Series:
     """Unix seconds -> Eastern Time timestamps (works on empty columns too)."""
     return pd.to_datetime(ts.astype("float64"), unit="s", utc=True).dt.tz_convert(TZ)
+
+
+class DrawdownTracker:
+    """
+    Same result as max_drawdowns(), but each call only reads the equity rows added since the last
+    call (equity rows are append-only, so their rowid only grows). The first call reads everything
+    once; after that a refresh costs a few hundred rows instead of the whole history, which keeps
+    a dashboard that runs for months on a Raspberry Pi fast.
+    """
+
+    def __init__(self, db_path: str):
+        self.db_path = db_path
+        self.last_rowid = 0
+        self.peak: dict[str, float] = {}
+        self.dd: dict[str, float] = {}
+        self._lock = threading.Lock()
+
+    def update(self) -> dict[str, float]:
+        with self._lock:          # several dashboard tabs may refresh at the same moment
+            return self._update()
+
+    def _update(self) -> dict[str, float]:
+        con = sqlite3.connect(f"file:{self.db_path}?mode=ro", uri=True)
+        try:
+            cur = con.execute("SELECT rowid, strategy, equity FROM equity WHERE rowid > ? ORDER BY rowid",
+                              (self.last_rowid,))
+            while True:
+                rows = cur.fetchmany(50_000)
+                if not rows:
+                    break
+                for rowid, strat, eq in rows:
+                    if eq is None:
+                        continue
+                    peak = max(self.peak.get(strat, eq), eq)
+                    self.peak[strat] = peak
+                    if peak > 0:
+                        self.dd[strat] = min(self.dd.get(strat, 0.0), eq / peak - 1)
+                self.last_rowid = rows[-1][0]
+        finally:
+            con.close()
+        return dict(self.dd)
 
 
 def _tables(con) -> set[str]:
