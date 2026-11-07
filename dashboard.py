@@ -1,0 +1,570 @@
+"""
+Portfolio dashboard.   Run:  streamlit run dashboard.py
+Opens in your browser at http://localhost:8501. Reads the database only,
+so it's safe to keep open while the bot runs.
+
+Layout: live section (refreshes every LIVE_SECONDS) with headline numbers, the leaderboard,
+open bets and last-hour charts; then all-time analysis and a per-strategy drill-down.
+
+"Restart charts from now" (sidebar) only changes what the CHARTS show: they start at the moment
+you press it. Nothing in the database is touched and the bot keeps recording; tables and totals
+stay all-time. The start time is kept in the page URL (?since=...), so a browser refresh keeps it.
+"""
+import glob
+import json
+import math
+import os
+import sys
+import time
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, HERE)
+os.chdir(HERE)
+
+import pandas as pd
+import plotly.express as px
+import plotly.graph_objects as go
+import streamlit as st
+
+import config
+from core import metrics
+
+st.set_page_config(page_title="Polymarket Paper Desk", page_icon="📈", layout="wide")
+
+LIVE_SECONDS = 5          # how often the live section refreshes
+WINDOW = 3600             # the time charts always show this many seconds (last hour)
+
+# Categorical palette (validated reference palette; light / dark steps). Colors follow the
+# strategy (its order in the database), never its rank, so filtering never repaints a line.
+PALETTE_LIGHT = ["#2a78d6", "#eb6834", "#1baf7a", "#eda100", "#e87ba4", "#008300", "#6250d6", "#e34948"]
+PALETTE_DARK = ["#3987e5", "#d95926", "#199e70", "#c98500", "#d55181", "#008300", "#9085e9", "#e66767"]
+DARK = getattr(getattr(st.context, "theme", None), "type", "light") == "dark"
+PALETTE = PALETTE_DARK if DARK else PALETTE_LIGHT
+MUTED = "#8a8985"
+
+MARKET_NAMES = {m["asset"]: m.get("name") or m["asset"] for m in config.MARKETS}
+# Break-even lines on the calibration chart (taker fee coefficients)
+US_FEE_LINES = [(0.095, "Θ 0.095 (Polymarket US, under $10k 30-day volume)"),
+                (0.0695, "Θ 0.0695 (Polymarket US, $250k+ volume / first 7 days)")]
+INTL_FEE_LINES = [(0.07, "0.07 (polymarket.com crypto)")]
+DB_LABELS = {"data/paper_us.db": "Live paper trading · Polymarket US", "data/sim_us.db": "Simulator · Polymarket US",
+             "data/paper.db": "Live paper trading · polymarket.com", "data/sim.db": "Simulator · polymarket.com"}
+CURRENT = {s.name for s in config.STRATEGIES}   # strategies in config.py right now (others are "retired")
+TITLES = {s.name: s.title for s in config.STRATEGIES}
+DESCRIPTIONS = {s.name: s.description for s in config.STRATEGIES}
+DETAILS = {s.name: s.details for s in config.STRATEGIES}
+
+
+def title_of(name):
+    return TITLES.get(name, f"{name} (retired)")
+
+
+def market_of(asset):
+    return MARKET_NAMES.get(asset, asset)
+
+
+def relabel(df, col="strategy"):
+    """Swap internal strategy names for the friendly titles (for charts and tables)."""
+    if df is None or not len(df) or col not in df:
+        return df
+    df = df.copy()
+    df[col] = df[col].map(title_of)
+    return df
+
+
+def money(x, signed=False):
+    if x is None or (isinstance(x, float) and math.isnan(x)):
+        return "—"
+    return f"{x:+,.2f}".replace("+", "+$").replace("-", "-$") if signed else f"${x:,.2f}"
+
+
+def pct(x, signed=False, digits=1):
+    if x is None or (isinstance(x, float) and math.isnan(x)):
+        return "—"
+    return f"{x:+.{digits}f}%" if signed else f"{x:.{digits}f}%"
+
+
+def style(fig, height, y_title=None, legend=True):
+    """One look for every chart: thin lines, recessive grid, crosshair hover, legend on top."""
+    fig.update_layout(
+        height=height, margin=dict(l=8, r=8, t=8, b=8), legend_title_text="",
+        showlegend=legend, hovermode="x unified",
+        legend=dict(orientation="h", yanchor="bottom", y=1.0, xanchor="left", x=0),
+        yaxis_title=y_title, xaxis_title=None)
+    fig.update_xaxes(showgrid=False, showspikes=True, spikemode="across", spikethickness=1,
+                     spikecolor=MUTED, spikedash="solid")
+    fig.update_yaxes(gridcolor="rgba(128,128,128,0.15)", zerolinecolor="rgba(128,128,128,0.4)")
+    fig.update_traces(selector=dict(type="scatter", mode="lines"), line_width=2)
+    return fig
+
+
+SIGNED_MONEY = lambda x: money(x, signed=True)   # noqa: E731
+
+
+def table(df, formats, column_config=None, **kw):
+    """
+    A dataframe with consistent number formats ('—' for blanks, '+$1.23' for signed money).
+    Values are formatted to text here: Streamlit shows empty numbers as "None" whatever the
+    Styler says. Rows keep the order they arrive in (newest first / best first).
+    """
+    out = df.copy()
+    for col, f in formats.items():
+        if col in out:
+            fn = f if callable(f) else f.format
+            out[col] = [("—" if v is None or (not isinstance(v, str) and pd.isna(v)) else fn(v)) for v in out[col]]
+    st.dataframe(out, hide_index=True, width="stretch", column_config=column_config, **kw)
+
+
+def TS(t):
+    return "—" if pd.isna(t) else f"{t:%b %d %H:%M:%S}"
+
+
+def chart(fig, key):
+    st.plotly_chart(fig, width="stretch", key=key, config={"displayModeBar": False})
+
+
+# ---------------------------------------------------------------- data (cached)
+def _db_version(path):
+    """Changes whenever the bot writes (the WAL file grows), so the cache below refreshes then."""
+    return tuple(os.path.getmtime(p) if os.path.exists(p) else 0 for p in (path, path + "-wal"))
+
+
+@st.cache_data(ttl=60, show_spinner=False)
+def load_max_dd(path, minute):
+    return metrics.max_drawdowns(path)       # whole-history scan: refreshed once a minute is plenty
+
+
+@st.cache_data(ttl=60, show_spinner=False, max_entries=4)
+def load_data(path, version, since=None):
+    return metrics.load(path, equity_window=WINDOW, max_dd=load_max_dd(path, int(time.time() // 60)), since=since)
+
+
+# ---------------------------------------------------------------- sidebar
+st.sidebar.title("📈 Paper Desk")
+dbs = sorted(p.replace("\\", "/") for p in glob.glob("data/*.db"))   # Windows returns backslashes
+if not dbs:
+    st.info("No data yet. Start the bot (`python run.py`) or the simulator (`python tools/simulate.py`).")
+    st.stop()
+default_db = config.DB_PATH.replace("\\", "/")
+db = st.sidebar.selectbox(
+    "Data source", dbs, index=dbs.index(default_db) if default_db in dbs else 0,
+    format_func=lambda p: DB_LABELS.get(p, p))
+
+# ---- chart start ("Restart charts from now"): display only, kept in the URL so a refresh keeps it
+try:
+    SINCE = float(st.query_params.get("since")) if st.query_params.get("since") else None
+except (TypeError, ValueError):
+    SINCE = None
+with st.sidebar.container(border=True):
+    st.markdown("**Charts**")
+    if st.button("Restart charts from now", icon=":material/restart_alt:", width="stretch",
+                 help="Charts start fresh from this moment. Saved data is untouched and the bot keeps "
+                      "recording; tables and totals stay all-time."):
+        st.query_params["since"] = str(int(time.time()))
+        st.cache_data.clear()
+        st.rerun()
+    if SINCE is not None:
+        st.caption(f"Charts since {pd.Timestamp(SINCE, unit='s', tz='UTC').tz_convert(metrics.TZ):%b %d %H:%M:%S} ET")
+        if st.button("Show full history", width="stretch"):
+            del st.query_params["since"]
+            st.cache_data.clear()
+            st.rerun()
+    else:
+        st.caption("Showing the last hour (live charts) and all history (analysis charts).")
+
+d0 = load_data(db, _db_version(db), SINCE)
+EXCHANGE = d0.get("exchange", "polymarket_intl")
+FEE_LINES = US_FEE_LINES if EXCHANGE == "polymarket_us" else INTL_FEE_LINES
+if not len(d0["strategies"]):
+    st.info("The database is empty. Start the bot and give it a minute.")
+    st.stop()
+
+all_strats = d0["strategies"]["name"].tolist()
+retired = [n for n in all_strats if n not in CURRENT]
+show_retired = bool(retired) and st.sidebar.toggle(
+    f"Show retired strategies ({len(retired)})", value=False,
+    help="Strategies in this database that are no longer in config.py (e.g. replaced by a _v2).")
+shown = all_strats if show_retired else ([n for n in all_strats if n in CURRENT] or all_strats)
+picked = st.sidebar.multiselect("Strategies", shown, default=shown, format_func=title_of)
+live = st.sidebar.toggle(f"Live (refresh every {LIVE_SECONDS}s)", value=True)
+# config.py order first, then retired ones: fixed per strategy, so filtering never repaints a line
+color_order = [s.name for s in config.STRATEGIES] + [n for n in all_strats if n not in CURRENT]
+color_map = {title_of(s): PALETTE[i % len(PALETTE)] for i, s in enumerate(color_order)}
+
+with st.sidebar.expander("Strategy guide"):
+    for name in picked:
+        st.markdown(f"**{title_of(name)}** — {DESCRIPTIONS.get(name) or 'no description'}")
+        if DETAILS.get(name):
+            with st.popover("How it works"):
+                st.markdown(DETAILS[name])
+with st.sidebar.expander("Glossary"):
+    st.markdown(
+        "- **t-stat**: average P&L ÷ its standard error. Under ~2 = could be luck.\n"
+        "- **Max DD**: worst drop from a previous high.\n"
+        "- **Profit / $1**: realized P&L per dollar spent buying (rounds that have finished only).\n"
+        "- **Avg price**: average price paid per share; at 0.90 you need a >91% win rate to break even.\n"
+        "- **Unrealized**: what an open bet is worth at the current mid, minus what it cost.\n"
+        "- **Fee Θ**: taker fee coefficient on the latest trade. Polymarket US fee = Θ × contracts × p × (1−p), "
+        "rounded to the cent; Θ is 0.095 below $10k of 30-day volume, 0.085 / 0.075 / 0.0695 above.\n"
+        "- **Volume** (Polymarket US): contracts × price of the side received (a sale counts contracts × (1 − price)).\n"
+        "- **Stopped**: the strategy's portfolio value fell to the stop level, so it no longer trades.")
+
+
+def filtered(d):
+    d = dict(d)
+    d["strategies"] = d["strategies"][d["strategies"]["name"].isin(picked)]
+    for t in ("fills", "settlements", "equity"):
+        if len(d[t]):
+            d[t] = d[t][d[t]["strategy"].isin(picked)]
+    return d
+
+
+# ---------------------------------------------------------------- live section
+def live_section():
+    d = filtered(load_data(db, _db_version(db), SINCE))
+    if not len(d["strategies"]):
+        st.info("No strategies selected.")
+        return
+    now = time.time()
+    last_ts = max([d[t]["ts"].max() for t in ("equity", "snapshots") if len(d[t])], default=None)
+    is_live = last_ts is not None and now - last_ts < 120
+    anchor = now if is_live or last_ts is None else last_ts     # stopped bot / simulator: its last hour
+    start_ts = SINCE if SINCE is not None else anchor - WINDOW      # where the live charts begin
+    x0 = pd.Timestamp(start_ts, unit="s", tz="UTC").tz_convert(metrics.TZ)
+    x1 = pd.Timestamp(anchor, unit="s", tz="UTC").tz_convert(metrics.TZ)
+
+    # header
+    h1, h2 = st.columns([3, 2], vertical_alignment="center")
+    h1.markdown("### Polymarket Paper Desk")
+    with h2:
+        if is_live:
+            st.badge(f"Live · data {now - last_ts:.0f}s old", icon=":material/radio_button_checked:", color="green")
+        elif last_ts is not None:
+            st.badge(f"Not live · last data {x1:%b %d %H:%M} ET", icon=":material/pause_circle:", color="orange")
+
+    summ = metrics.summary(d)
+    ops = metrics.open_positions_marked(d)
+
+    # KPI row
+    bankroll = d["strategies"]["bankroll"].sum()
+    total = summ["Portfolio value"].sum()
+    best = summ.sort_values("Total return", ascending=False).iloc[0]
+    kpis = st.container(horizontal=True, wrap=True, gap="small")
+    W = 190
+    kpis.metric("Best strategy", title_of(best["Strategy"]), pct(best["Total return"], signed=True, digits=2),
+                border=True, width=W, help="Highest total return so far.")
+    kpis.metric("Combined value", money(total), money(total - bankroll, signed=True), border=True, width=W,
+                help=f"All selected strategies together, vs. their combined bankroll of {money(bankroll)}.")
+    kpis.metric("Realized P&L", money(summ["Realized P&L"].sum(), signed=True), border=True, width=W,
+                help="Profit or loss from finished trades only.")
+    kpis.metric("Open bets", money(ops["value"].sum() if len(ops) else 0.0),
+                money(ops["unrealized"].sum(), signed=True) if len(ops) else None, border=True, width=W,
+                help="Current value of bets in rounds that haven't ended (at the mid price); delta = unrealized P&L.")
+    kpis.metric("Trades finished", f"{int(summ['Trades'].sum()):,}", border=True, width=W,
+                help="Bets whose round has ended and been paid out.")
+    kpis.metric("Fees", money(summ["Fees"].sum()), border=True, width=W, help="Polymarket taker fees paid.")
+    kpis.metric("Money bet", f"${summ['Money bet'].sum():,.0f}", border=True, width=W,
+                help="Dollars spent buying shares (sales not included).")
+    n_stop = int((summ["Status"] == "Stopped").sum())
+    kpis.metric("Stopped", f"{n_stop} of {len(summ)}", border=True, width=W,
+                help=f"Strategies whose portfolio value fell to the stop level "
+                     f"(${float(d0['meta'].get('stop_equity', 0) or 0):,.0f}) and no longer trade.")
+    if summ["Trades"].sum() < 30:
+        st.caption(":material/info: Fewer than 30 finished trades — results are mostly luck so far.")
+
+    # leaderboard with last-hour sparklines
+    eq = metrics.equity_curves(d)
+    spark = {}
+    if len(eq):
+        recent = eq[eq["ts"] >= start_ts]
+        spark = {n: g.sort_values("ts")["return_pct"].round(3).tolist() for n, g in recent.groupby("strategy")}
+    lb = summ.assign(Trend=summ["Strategy"].map(lambda n: spark.get(n, [])),
+                     Strategy=summ["Strategy"].map(title_of)).sort_values("Total return", ascending=False)
+    cols = ["Strategy", "Status", "Trend", "Portfolio value", "Total return", "Realized P&L", "Trades", "Win rate",
+            "Avg P&L per trade", "Luck check (t-stat)", "Worst drop", "Profit per $1 bet", "Avg price paid",
+            "Fees", "Fee theta", "Rebates", "Money bet", "Volume traded"]
+    cc = st.column_config
+    table(lb[cols], {
+        "Portfolio value": money, "Total return": lambda x: pct(x, signed=True, digits=2),
+        "Realized P&L": SIGNED_MONEY, "Trades": "{:,.0f}", "Win rate": pct, "Avg P&L per trade": SIGNED_MONEY,
+        "Luck check (t-stat)": "{:.2f}", "Worst drop": lambda x: pct(x, digits=2), "Profit per $1 bet": "{:+.3f}",
+        "Avg price paid": "{:.3f}", "Fees": money, "Money bet": "${:,.0f}", "Volume traded": "${:,.0f}",
+        "Fee theta": "{:.4f}", "Rebates": money,
+    }, column_config={
+        "Status": cc.Column("Status", help="Stopped = portfolio value hit the stop level; it no longer trades."),
+        "Fee theta": cc.Column("Fee Θ", help="Taker fee coefficient on the latest trade (Polymarket US: by 30-day volume tier)."),
+        "Rebates": cc.Column("Rebates", help="Taker rebates earned (Polymarket US: from $250k of 30-day volume)."),
+        "Trend": cc.LineChartColumn("Since chart start" if SINCE else "Last hour",
+                                    help="Return % over the charted period.", width="small"),
+        "Portfolio value": cc.Column("Value", help="Cash plus open bets at the mid price."),
+        "Total return": cc.Column("Return", help="Versus the starting bankroll."),
+        "Realized P&L": cc.Column("Realized", help="Finished trades only."),
+        "Trades": cc.Column("Trades", help="Finished (paid-out) trades."),
+        "Win rate": cc.Column("Win %", help="Share of finished trades with a profit. Read it with Avg price."),
+        "Avg P&L per trade": cc.Column("Avg P&L"),
+        "Luck check (t-stat)": cc.Column("t-stat", help="Under ~2 = can't rule out luck."),
+        "Worst drop": cc.Column("Max DD", help="Worst drop from a previous high (all time)."),
+        "Profit per $1 bet": cc.Column("P&L / $1", help="Realized P&L per dollar bought."),
+        "Avg price paid": cc.Column("Avg price", help="Average price paid per share."),
+        "Fees": cc.Column("Fees"), "Money bet": cc.Column("Bought", help="Dollars spent buying."),
+        "Volume traded": cc.Column("Volume", help="Polymarket US volume: contracts × price of the side received."
+                                   if EXCHANGE == "polymarket_us" else "Bought plus sold."),
+    })
+
+    # last-hour charts (fixed 60-minute x-axis)
+    st.markdown("##### Since chart restart" if SINCE is not None else "##### Last hour")
+    c1, c2 = st.columns([3, 2])
+    with c1:
+        if len(eq):
+            e = eq[eq["ts"] >= start_ts].copy()
+            y_lbl = "Return %"
+            if SINCE is not None and len(e):     # fresh start: change since the restart point
+                first = e.sort_values("ts").groupby("strategy")["equity"].transform("first")
+                e["return_pct"] = (e["equity"] / first - 1) * 100
+                y_lbl = "Change since chart restart %"
+            e = relabel(e)
+            fig = px.line(e, x="time", y="return_pct", color="strategy", color_discrete_map=color_map,
+                          labels={"return_pct": y_lbl, "strategy": "Strategy", "time": "Time (ET)"})
+            fig.add_hline(y=0, line_dash="dot", line_color=MUTED, line_width=1)
+            fig.update_xaxes(range=[x0, x1])
+            chart(style(fig, 300, y_lbl), "eq")
+        else:
+            st.caption("Equity appears after the bot has run for a few seconds.")
+    with c2:
+        tl = metrics.realized_timeline(d)
+        fig = go.Figure()
+        for name in picked:
+            s = tl[tl.strategy == name] if len(tl) else tl
+            before = s[s.ts < start_ts]
+            base = before["cum_pnl"].iloc[-1] if len(before) else 0.0
+            inside = s[s.ts >= start_ts]
+            offset = base if SINCE is not None else 0.0     # after a restart: P&L since the restart
+            start = base - offset
+            xs = [x0] + inside["time"].tolist() + [x1]
+            ys = [start] + (inside["cum_pnl"] - offset).tolist() + [
+                (inside["cum_pnl"].iloc[-1] - offset) if len(inside) else start]
+            fig.add_trace(go.Scatter(x=xs, y=ys, mode="lines", line_shape="hv", name=title_of(name),
+                                     line=dict(color=color_map.get(title_of(name)))))
+        fig.add_hline(y=0, line_dash="dot", line_color=MUTED, line_width=1)
+        fig.update_xaxes(range=[x0, x1])
+        fig.update_yaxes(tickprefix="$")
+        chart(style(fig, 300, "Realized P&L since restart" if SINCE is not None else "Realized P&L (all time)",
+                    legend=False), "realized")
+
+    c1, c2 = st.columns([3, 2])
+    with c1:
+        snaps = d["snapshots"]
+        snaps = snaps[snaps["ts"] >= start_ts] if len(snaps) else snaps
+        if len(snaps):
+            s = snaps.copy()
+            s["up_mid"] = s[["up_bid", "up_ask"]].mean(axis=1)   # one side missing -> the other
+            s["Market"] = s["asset"].map(market_of)
+            # markets aren't strategies, so they stay neutral gray (dash style tells them apart)
+            fig = px.line(s, x="time", y="up_mid", line_dash="Market", color_discrete_sequence=[MUTED],
+                          labels={"up_mid": "Price of Up", "time": "Time (ET)"})
+            fig.add_hline(y=0.5, line_dash="dot", line_color=MUTED, line_width=1)
+            fig.update_xaxes(range=[x0, x1])
+            fig.update_yaxes(range=[0, 1])
+            chart(style(fig, 260, "Price of 'Up'"), "market")
+        else:
+            st.caption("No market data in the last hour.")
+    with c2:
+        if len(snaps):
+            latest = snaps.sort_values("ts").groupby("asset").tail(1)
+            for c in ("price_to_beat", "index_price"):
+                if c not in latest:
+                    latest = latest.assign(**{c: float("nan")})
+            q = latest.assign(Market=latest["asset"].map(market_of))[[
+                "Market", "seconds_left", "up_bid", "up_ask", "down_bid", "down_ask", "up_ask_depth", "down_ask_depth",
+                "price_to_beat", "index_price"]]
+            px3 = "{:.3f}"
+            table(q, {"seconds_left": "{:.0f}", "up_bid": px3, "up_ask": px3, "down_bid": px3, "down_ask": px3,
+                      "up_ask_depth": "${:,.0f}", "down_ask_depth": "${:,.0f}",
+                      "price_to_beat": "${:,.2f}", "index_price": "${:,.2f}"}, column_config={
+                "price_to_beat": cc.Column("Price to beat", help="The round's open value (Polymarket US). Up wins if the close is at or above it."),
+                "index_price": cc.Column("BTC index", help="CF Benchmarks BRTI, the index Polymarket US settles on."),
+                "seconds_left": "Secs left", "up_bid": "Up bid", "up_ask": "Up ask", "down_bid": "Down bid",
+                "down_ask": "Down ask",
+                "up_ask_depth": cc.Column("Up depth", help="Dollars on offer to buy Up."),
+                "down_ask_depth": cc.Column("Down depth", help="Dollars on offer to buy Down.")})
+
+    # open bets (live)
+    st.markdown("##### Open bets")
+    if len(ops):
+        o = ops.assign(Strategy=ops["strategy"].map(title_of), Market=ops["asset"].map(market_of),
+                       Side=ops["outcome"].str.title())
+        table(o[["Strategy", "Market", "Side", "shares", "net_cost", "mark", "value", "unrealized", "seconds_left"]],
+              {"shares": "{:.1f}", "net_cost": money, "mark": "{:.3f}", "value": money, "unrealized": SIGNED_MONEY,
+               "seconds_left": "{:.0f}"}, column_config={
+                  "shares": "Shares", "net_cost": cc.Column("Cost", help="Net money put in, fees included."),
+                  "mark": cc.Column("Mark", help="Current mid price of that side."), "value": "Value",
+                  "unrealized": "Unrealized", "seconds_left": "Secs left"})
+    else:
+        st.caption("No open bets.")
+    return d
+
+
+st.fragment(run_every=LIVE_SECONDS if live else None)(live_section)()
+
+# ---------------------------------------------------------------- all-time analysis
+d = filtered(d0)
+if not len(d["strategies"]):
+    st.stop()
+dc = dict(d)          # chart data: only what happened after the chart restart (if one was pressed)
+if SINCE is not None:
+    for t in ("fills", "settlements"):
+        if len(dc[t]):
+            dc[t] = dc[t][dc[t]["ts"] >= SINCE]
+st.markdown(f"##### Since chart restart" if SINCE is not None else "##### All time")
+c1, c2, c3 = st.columns(3)
+with c1:
+    st.caption("P&L per finished trade")
+    if len(dc["settlements"]):
+        fig = px.strip(relabel(dc["settlements"]), x="strategy", y="pnl", color="strategy",
+                       color_discrete_map=color_map, labels={"pnl": "P&L ($)", "strategy": ""})
+        fig.add_hline(y=0, line_dash="dot", line_color=MUTED, line_width=1)
+        fig.update_traces(marker=dict(size=8, opacity=0.6))
+        fig.update_layout(hovermode="closest")
+        chart(style(fig, 300, "P&L ($)", legend=False).update_layout(hovermode="closest"), "dist")
+    else:
+        st.caption("No finished trades yet.")
+with c2:
+    st.caption("Price paid vs. win rate (held to result). Dotted = fair price; solid = break-even after "
+               "taker fees. Only dots above the solid line made money.")
+    cal = metrics.calibration(dc)
+    if len(cal):
+        fig = px.scatter(relabel(cal), x="avg_price", y="win_rate", size="fills", color="strategy",
+                         color_discrete_map=color_map, size_max=18,
+                         labels={"avg_price": "Avg price paid", "win_rate": "Win rate", "fills": "Trades",
+                                 "strategy": "Strategy"})
+        fig.add_trace(go.Scatter(x=[0, 1], y=[0, 1], mode="lines", line=dict(dash="dot", color=MUTED, width=1),
+                                 name="fair price", showlegend=False, hoverinfo="skip"))
+        for i, (theta, label) in enumerate(FEE_LINES):   # what you need to win once the taker fee is paid
+            be = metrics.break_even_curve(theta)
+            fig.add_trace(go.Scatter(x=be["price"], y=be["win_rate"], mode="lines",
+                                     line=dict(color=MUTED, width=1.5, dash="solid" if i == 0 else "dash"),
+                                     name=f"break-even, {label}", showlegend=False,
+                                     hovertemplate=f"break-even {label}: %{{y:.3f}}<extra></extra>"))
+        fig.update_xaxes(range=[-0.02, 1.02])
+        fig.update_yaxes(range=[-0.05, 1.08])   # room so bubbles at 0% / 100% aren't clipped
+        chart(style(fig, 300, "Win rate", legend=False).update_layout(hovermode="closest"), "cal")
+    else:
+        st.caption("Needs finished trades held to the result.")
+with c3:
+    st.caption("Realized P&L by hour of day (ET)")
+    hr = metrics.pnl_by_hour(dc)
+    if len(hr):
+        fig = px.bar(relabel(hr), x="hour_et", y="pnl", color="strategy", barmode="group",
+                     color_discrete_map=color_map, labels={"hour_et": "Hour (ET)", "pnl": "P&L ($)",
+                                                           "strategy": "Strategy"})
+        fig.update_traces(marker_line_width=0, marker_cornerradius=4)
+        fig.update_layout(bargap=0.25, bargroupgap=0.1)
+        fig.update_xaxes(dtick=2)
+        chart(style(fig, 300, "P&L ($)", legend=False).update_layout(hovermode="closest"), "hour")
+    else:
+        st.caption("No finished trades yet.")
+
+# ---------------------------------------------------------------- drill-down
+st.markdown("##### Strategy detail")
+who = st.selectbox("Strategy", picked, format_func=title_of, label_visibility="collapsed")
+cc = st.column_config
+t1, t2, t3, t4 = st.tabs(["Round trips", "Finished trades", "Fills", "Settings"])
+with t1:
+    rt = metrics.round_trips({"fills": d["fills"][d["fills"].strategy == who] if len(d["fills"]) else d["fills"],
+                              "settlements": d["settlements"]})
+    if len(rt):
+        done = rt[rt.exit_type != "Open"]
+        a, b, c, e = st.columns(4)
+        a.metric("Round trips", f"{len(done):,}", border=True)
+        b.metric("Win rate", pct((done.pnl > 0).mean() * 100) if len(done) else "—", border=True)
+        c.metric("Avg P&L", money(done.pnl.mean(), signed=True) if len(done) else "—", border=True)
+        e.metric("Avg hold", f"{done.hold_s.mean():.0f}s" if len(done) else "—", border=True)
+        left, right = st.columns([1, 2])
+        with left:
+            if len(done):
+                by = done.groupby("exit_type").agg(trips=("pnl", "size"), total=("pnl", "sum"),
+                                                   avg=("pnl", "mean")).reset_index()
+                table(by, {"trips": "{:,.0f}", "total": SIGNED_MONEY, "avg": SIGNED_MONEY},
+                      column_config={"exit_type": "Exit", "trips": "Trips", "total": "Total", "avg": "Avg"})
+            labels = [f"{r.entry_time:%b %d %H:%M:%S} · {r.outcome.title()} · "
+                      f"{('open' if r.exit_type == 'Open' else money(r.pnl, signed=True))}" for r in rt.itertuples()]
+            pick = st.selectbox("Price path for", range(len(rt)), format_func=lambda i: labels[i], key="rt_pick")
+        with right:
+            r = rt.iloc[pick]
+            t_end = r.exit_ts if r.exit_ts == r.exit_ts else time.time()
+            path = metrics.price_path(db, r.slug, r.entry_ts, t_end)
+            if len(path):
+                fig = go.Figure()
+                if r.outcome == "BOTH":   # a hedge: show the sell price of both sides
+                    for k, name, color in (("up", "Up bid", PALETTE[0]), ("down", "Down bid", PALETTE[1])):
+                        fig.add_trace(go.Scatter(x=path["time"], y=path[f"{k}_bid"], name=name, mode="lines",
+                                                 line=dict(color=color)))
+                else:
+                    k = "up" if r.outcome == "UP" else "down"
+                    fig.add_trace(go.Scatter(x=path["time"], y=path[f"{k}_ask"], name="Ask (buy)", mode="lines",
+                                             line=dict(color=PALETTE[1])))
+                    fig.add_trace(go.Scatter(x=path["time"], y=path[f"{k}_bid"], name="Bid (sell)", mode="lines",
+                                             line=dict(color=PALETTE[0])))
+                    fig.add_trace(go.Scatter(x=[r.entry_time], y=[r.entry_price], name="Entry", mode="markers",
+                                             marker=dict(size=12, symbol="triangle-up", color=PALETTE[2],
+                                                         line=dict(width=2, color="white"))))
+                    if r.exit_type != "Open":
+                        fig.add_trace(go.Scatter(x=[r.exit_time], y=[r.exit_price], name=r.exit_type,
+                                                 mode="markers", marker=dict(size=12, symbol="x", color=MUTED)))
+                fig.update_yaxes(range=[0, 1.02])
+                chart(style(fig, 280, f"Price of {r.outcome.title()}"), "path")
+            else:
+                st.caption("No price data recorded for this period.")
+        show = rt.assign(Market=rt["asset"].map(market_of), outcome=rt["outcome"].str.title())
+        table(show[["entry_time", "exit_time", "Market", "outcome", "entry_price", "exit_price", "shares",
+                    "hold_s", "exit_type", "fees", "pnl", "return_pct"]],
+              {"entry_time": TS, "exit_time": TS, "entry_price": "{:.3f}", "exit_price": "{:.3f}",
+               "shares": "{:.1f}", "hold_s": "{:.0f}", "fees": money, "pnl": SIGNED_MONEY,
+               "return_pct": lambda x: pct(x, signed=True)},
+              column_config={"entry_time": "Entered (ET)", "exit_time": "Exited (ET)",
+                             "outcome": cc.Column("Side", help="BOTH = bought both sides; prices are per pair."),
+                             "entry_price": "Entry", "exit_price": "Exit", "shares": "Shares", "hold_s": "Held (s)",
+                             "exit_type": "Exit", "fees": "Fees", "pnl": "P&L", "return_pct": "Return"})
+    else:
+        st.caption("No round trips yet.")
+with t2:
+    s = d["settlements"]
+    s = s[s.strategy == who] if len(s) else s
+    if len(s):
+        s = s.sort_values("ts", ascending=False).assign(Market=lambda x: x["asset"].map(market_of),
+                                                         winner=lambda x: x["winner"].str.title())
+        table(s[["time", "Market", "winner", "up_shares", "down_shares", "net_cost", "payout", "pnl"]],
+              {"time": TS, "up_shares": "{:.1f}", "down_shares": "{:.1f}", "net_cost": money,
+               "payout": money, "pnl": SIGNED_MONEY},
+              column_config={"time": "Time (ET)", "winner": "Result", "up_shares": "Up sh", "down_shares": "Down sh",
+                             "net_cost": "Cost", "payout": "Payout", "pnl": "P&L"})
+    else:
+        st.caption("No finished trades yet.")
+with t3:
+    f = d["fills"]
+    f = f[f.strategy == who] if len(f) else f
+    if len(f):
+        f = f.sort_values("ts", ascending=False).assign(
+            Market=lambda x: x["asset"].map(market_of), outcome=lambda x: x["outcome"].str.title(),
+            side=lambda x: x["side"].map({"BUY": "Buy", "SELL": "Sell"}))
+        table(f[["time", "Market", "side", "outcome", "shares", "avg_price", "usd", "fee", "reason"]],
+              {"time": TS, "shares": "{:.1f}", "avg_price": "{:.3f}", "usd": money, "fee": "${:.3f}"},
+              column_config={"time": "Time (ET)", "side": "Action", "outcome": "Side", "shares": "Shares",
+                             "avg_price": "Price", "usd": "Amount", "fee": "Fee", "reason": "Why"})
+    else:
+        st.caption("No fills yet.")
+with t4:
+    row = d["strategies"].set_index("name").loc[who]
+    stat = d0["status"]
+    stop_row = stat[stat["name"] == who] if len(stat) else stat
+    if len(stop_row):
+        r0 = stop_row.iloc[0]
+        st.warning(f"Stopped trading at {pd.Timestamp(r0['stopped_at'], unit='s', tz='UTC').tz_convert(metrics.TZ):%b %d %H:%M:%S} ET: "
+                   f"{r0['reason']}. Open bets still settle.")
+    st.json({"Exchange": "Polymarket US" if EXCHANGE == "polymarket_us" else "polymarket.com",
+             "Type": row["class"], "Starting bankroll ($)": row["bankroll"],
+             "Stop level ($)": float(d0["meta"].get("stop_equity", 0) or 0),
+             "Markets": json.loads(row["assets"]) if isinstance(row["assets"], str) else row["assets"],
+             "Settings": json.loads(row["params"]) if isinstance(row["params"], str) else row["params"]})
+    if DETAILS.get(who):
+        st.markdown(DETAILS[who])

@@ -1,0 +1,12 @@
+# Only this PC can open the dashboard. (Streamlit listens on every network interface by
+# default, which lets other devices on your network -- or the internet, if a port is
+# forwarded -- see your dashboard.) Remove this line to open it up again on purpose.
+[server]
+address = "localhost"
+
+[browser]
+gatherUsageStats = false
+
+[client]
+# Hide Streamlit's developer menu and its pop-ups; this dashboard is only for viewing.
+toolbarMode = "minimal"
