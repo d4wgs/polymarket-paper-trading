@@ -64,6 +64,8 @@ class MinuteBuckets(Strategy):
         "buckets": 3,
         "max_entry": 0.85,
         "entry_window_seconds": 10,      # buy within this many seconds of the final minute starting
+        "min_side_price": None,          # market-agreement gate: skip unless that side's mid >= this (v2: 0.50).
+                                         # v1 bought 2-35c sides the market disagreed with and lost 5 of 5.
         "stake_usd": 25.0,
         "stake_fraction": None,
     }
@@ -84,6 +86,10 @@ class MinuteBuckets(Strategy):
         elif all(m < 0 for m in moves):
             side = DOWN
         else:
+            return []
+        mid = ctx.book(side).mid
+        if self.p["min_side_price"] is not None and (mid is None or mid < self.p["min_side_price"]):
+            ctx.event("buckets_market_disagrees", side=side, mid=mid)
             return []
         ask = ctx.book(side).best_ask
         if ask is None or ask > self.p["max_entry"]:

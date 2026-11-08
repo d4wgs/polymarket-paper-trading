@@ -5,7 +5,7 @@ by tools/export_trades.py.
 
 Definitions
   Trades              BUY fills (entries). Rounds = settled rounds the strategy had money in.
-  PnL after fees      sum of settled rounds' P&L (fees are inside it).
+  PnL after fees      sum of finished trades' P&L (settled rounds + rounds fully exited early; fees inside).
   PnL before fees     PnL after fees + fees paid in those rounds - rebates.
   Win rate            rounds with P&L > 0 / rounds.
   Avg entry price     share-weighted average BUY price.
@@ -25,6 +25,8 @@ import sqlite3
 
 import numpy as np
 import pandas as pd
+
+from core import metrics
 
 TIME_LEFT_BUCKETS = [0, 30, 60, 120, 300, 600, 900, float("inf")]
 TIME_LEFT_LABELS = ["0-30s", "30-60s", "1-2m", "2-5m", "5-10m", "10-15m", "15m+"]
@@ -72,12 +74,13 @@ def scorecard(lab: dict, strategies: list[str], max_dd: dict | None = None,
               bankrolls: dict | None = None) -> pd.DataFrame:
     fills = _with_winner(lab["fills"], lab["resolutions"])
     sett = lab["settlements"]
+    closed = metrics.closed_rounds(lab["fills"], sett)
     rows = []
     for name in strategies:
         f = fills[fills.strategy == name] if len(fills) else fills
-        st = sett[sett.strategy == name] if len(sett) else sett
+        st = closed[closed.strategy == name] if len(closed) else closed     # finished trades
         buys = f[f.side == "BUY"] if len(f) else f
-        pnl = st["pnl"] if len(st) else pd.Series(dtype=float)
+        pnl = st["pnl"].astype(float) if len(st) else pd.Series(dtype=float)
         settled = set(st["slug"]) if len(st) else set()
         f_set = f[f.slug.isin(settled)] if len(f) else f
         fees_settled = f_set["fee"].sum() - f_set["rebate"].fillna(0).sum() if len(f_set) else 0.0
@@ -108,6 +111,24 @@ def scorecard(lab: dict, strategies: list[str], max_dd: dict | None = None,
             "maker_share": (f["liquidity"] == "maker").mean() if len(f) else np.nan,
         })
     return pd.DataFrame(rows)
+
+
+def scorecard_by_kind(lab: dict, strategies: list[str], bankrolls: dict | None = None) -> pd.DataFrame:
+    """The scorecard computed separately for each round length (5m, 15m): one row per strategy x market.
+    Max drawdown is per account, not per market, so it is left out here."""
+    kinds = sorted({kind_of(a) for t in ("fills", "settlements") for a in lab[t]["asset"].dropna().unique()
+                    if len(lab[t])}, key=lambda k: (len(k), k))
+    parts = []
+    for kind in kinds:
+        sub = {**lab}
+        for t in ("fills", "settlements"):
+            df = lab[t]
+            sub[t] = df[df["asset"].map(kind_of) == kind] if len(df) else df
+        sub["resolutions"] = lab["resolutions"]
+        sc = scorecard(sub, strategies, max_dd=None, bankrolls=bankrolls)
+        sc.insert(1, "kind", kind)
+        parts.append(sc[sc["trades"] > 0])
+    return pd.concat(parts, ignore_index=True) if parts else pd.DataFrame()
 
 
 def pnl_by_kind(lab: dict) -> pd.DataFrame:

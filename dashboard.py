@@ -633,6 +633,29 @@ def strategy_lab():
                   "sharpe": cc.Column("Sharpe/trade", help="Mean ÷ std of round P&L (not annualized)."),
                   "t_stat": cc.Column("t-stat", help="Under ~2 = can't rule out luck."),
                   "max_dd_pct": "Max DD", "fees": "Fees", "maker_share": cc.Column("Maker %", help="Share of fills that were maker fills.")})
+    # ---- 5m vs 15m: the leaderboard above combines both round lengths; this splits them
+    st.markdown("##### 5-minute vs 15-minute rounds")
+    st.caption("Everything above combines 5m and 15m. Here each strategy is scored separately per round length "
+               "(max drawdown isn't split because each strategy has one bankroll).")
+    by_kind = analytics.scorecard_by_kind(lab, picked, bankrolls=bankrolls)
+    if len(by_kind):
+        view = st.segmented_control("Show", ["Both", "5m", "15m"], default="Both", key="kind_view",
+                                    label_visibility="collapsed") or "Both"
+        bk_show = by_kind if view == "Both" else by_kind[by_kind["kind"] == view]
+        bk_show = bk_show.assign(strategy=bk_show["strategy"].map(title_of)).sort_values(
+            ["strategy", "kind"] if view == "Both" else ["pnl_after_fees"], ascending=[True, True] if view == "Both" else [False])
+        table(bk_show[["strategy", "kind", "pnl_after_fees", "pnl_before_fees", "trades", "rounds", "win_rate",
+                       "breakeven_win_rate", "avg_entry", "t_stat", "fees"]],
+              {"pnl_after_fees": SIGNED_MONEY, "pnl_before_fees": SIGNED_MONEY, "trades": "{:,.0f}",
+               "rounds": "{:,.0f}", "win_rate": lambda x: pct(x * 100), "breakeven_win_rate": lambda x: pct(x * 100),
+               "avg_entry": "{:.3f}", "t_stat": "{:+.2f}", "fees": money},
+              column_config={"strategy": "Strategy", "kind": "Market", "pnl_after_fees": "PnL after fees",
+                             "pnl_before_fees": "PnL before fees", "trades": "Trades", "rounds": "Rounds",
+                             "win_rate": "Win %", "breakeven_win_rate": "Breakeven %", "avg_entry": "Avg entry",
+                             "t_stat": "t-stat", "fees": "Fees"})
+    else:
+        st.caption("No trades yet.")
+
     c1, c2 = st.columns(2)
     with c1:
         st.caption("Model calibration: fair value of the side traded vs. how often it won. "

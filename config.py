@@ -110,7 +110,7 @@ def _assets_for(markets):
 
 
 def _build(key: str, block: dict):
-    cls = REGISTRY[key]
+    cls = REGISTRY[block.get("class") or key]     # `class:` lets several variants share one implementation
     params = {k: v for k, v in (block.get("params") or {}).items()}
     doc = inspect.getdoc(inspect.getmodule(cls)) or ""
     return cls(block.get("name") or key, assets=_assets_for(block.get("markets")),
@@ -121,9 +121,10 @@ def _build(key: str, block: dict):
 def build_strategies(raw: dict) -> list:
     out = []
     for key, block in (raw.get("strategies") or {}).items():
-        if key not in REGISTRY:
-            raise ValueError(f"config.yaml: unknown strategy {key!r}. Known: {sorted(REGISTRY)}")
         block = block or {}
+        if (block.get("class") or key) not in REGISTRY:
+            raise ValueError(f"config.yaml: unknown strategy {block.get('class') or key!r}. "
+                             f"Known: {sorted(REGISTRY)}")
         if block.get("enabled", True):
             out.append(_build(key, block))
         v = block.get("variant_4b")

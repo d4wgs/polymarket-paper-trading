@@ -27,6 +27,25 @@ Forward-tests six model-driven strategies on **Polymarket US** Bitcoin "Up or Do
 | `s5_complete_set` | 15s in, buys the pricier side (leg 1); buys the opposite side (leg 2) once leg 1's price is +10% or −5% (`pnl_basis: price`; `locked` counts fees and spread), or at 30s left. On Polymarket US leg 2 executes as selling leg 1. |
 | `s6_mean_reversion` | Fades a ≥ 12¢ price jump in 10s that fair value didn't confirm; exits at 50% reversion or 60s. 5m only. |
 
+### Variants added 2026-11-08 (each runs on its own $1,000 bankroll; the originals keep running as controls)
+
+Live result of the originals after ~1 day: `s4_momentum_v1` +$189 (316 trades, t = 0.8), `s3_sniper_v2` −$196 (169 trades). The sniper's 39 trades that paid under 70¢ lost $306 because the index it trusts is a lagged 60-second average, so these variants test fixes. None is proven yet; judge them on fresh data.
+
+| Config key (`class:`) | Name in the database | What changes |
+|---|---|---|
+| `s3_sniper_v3a` | `s3_sniper_v3a_floor50` | Sniper, but only buys if the winning side's ask is ≥ 50¢ (market agrees it is ahead) |
+| `s3_sniper_v3b` | `s3_sniper_v3b_floor70` | Same with a 70¢ floor |
+| `s3_sniper_v3c` | `s3_sniper_v3c_floor70_cap97` | 70¢ floor and a 97¢ cap (above that a win pays < 3¢) |
+| `s3_sniper_v3d` | `s3_sniper_v3d_model_floor50` | "Winning" comes from the fair-value model (live spot + settlement averaging) instead of the lagged index; 50¢ floor |
+| `s4_momentum_min80` | `s4_momentum_min80_v1` | S4 with the crowd price ≥ 80¢ |
+| `s4_momentum_edge` | `s4_momentum_edge0_v1` | S4 that also needs non-negative model edge |
+| `s4_momentum_15m` | `s4_momentum_15m_v1` | S4 on 15-minute rounds only |
+| `s4b_minute_buckets_v2` | `s4b_minute_buckets_v2` | Minute buckets + the side's mid must be ≥ 50¢ |
+
+A strategy block may set `class: <registry key>` so several variants share one implementation (see `config.yaml`). Offline replay of S4 on the logged ticks: the spot+oracle confirmation gave 79.2% wins / +$0.68 per trade vs 78.0% / +$0.49 for simply buying every favorite ≥ 70¢, so most of S4 is "buy the favorite".
+
+**5m vs 15m.** The leaderboard, KPIs and charts combine both round lengths. The dashboard's *Strategy lab* has a section **5-minute vs 15-minute rounds** with the scorecard (P&L, win %, breakeven %, avg entry, t-stat, fees) split per strategy and round length, with a Both / 5m / 15m switch.
+
 Old strategies (previous winner, last 60s, underdog, scalp) are in [`archive/`](archive/); their history stays in the database and shows on the dashboard as "retired".
 
 ## Turning strategies on/off and changing parameters
@@ -81,7 +100,7 @@ Trades are exported daily to `data/exports/trades_YYYY-MM-DD.csv` (ET day). On d
 python -m venv .venv
 .\.venv\Scripts\Activate.ps1
 pip install -r requirements.txt
-python -m unittest discover -s tests -v      # 64 tests
+python -m unittest discover -s tests -v      # 106 tests
 python tools/simulate.py --hours 24          # offline smoke test -> data/sim_us.db
 python run.py                                # the bot (Ctrl+C to stop)
 streamlit run dashboard.py                   # http://localhost:8501

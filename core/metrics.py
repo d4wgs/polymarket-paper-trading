@@ -116,19 +116,73 @@ def load(db_path: str, equity_window: float | None = None, max_dd: dict | None =
     return out
 
 
+def closed_rounds(fills: pd.DataFrame, sett: pd.DataFrame) -> pd.DataFrame:
+    """
+    One row per finished trade = (strategy, round) whose P&L is final:
+      * every settled round (P&L from the settlement row), and
+      * rounds the strategy has fully EXITED but that haven't ended / settled yet (e.g. a scalp or S5's
+        leg 2): P&L = sale proceeds - purchase cost, fees included -- exactly what the settlement row
+        will say later, since nothing is left to pay out.
+    Without the second kind, a closed trade's profit sat in cash (portfolio value) but stayed out of
+    "Realized P&L" until the round ended and was looked up, up to 15 minutes later.
+    Columns: strategy, slug, asset, ts (settlement or exit time), pnl, settled.
+    """
+    cols = ["strategy", "slug", "asset", "ts", "pnl", "settled"]
+    parts = []
+    if len(sett):
+        parts.append(sett[["strategy", "slug", "asset", "ts", "pnl"]].assign(settled=True))
+    if len(fills):
+        done = set(zip(sett["strategy"], sett["slug"])) if len(sett) else set()
+        f = fills[[(a, b) not in done for a, b in zip(fills["strategy"], fills["slug"])]]
+        if len(f):
+            f = f.assign(signed=np.where(f["side"] == "BUY", f["shares"], -f["shares"]),
+                         cash=np.where(f["side"] == "BUY", -(f["usd"] + f["fee"]), f["usd"] - f["fee"]))
+            left = f.groupby(["strategy", "slug", "outcome"])["signed"].sum().abs().groupby(level=[0, 1]).max()
+            g = f.groupby(["strategy", "slug"]).agg(asset=("asset", "first"), ts=("ts", "max"), pnl=("cash", "sum"))
+            g = g[left.reindex(g.index) <= 1e-6].reset_index()
+            if len(g):
+                parts.append(g.assign(settled=False)[cols])
+    if not parts:
+        return pd.DataFrame(columns=cols)
+    return pd.concat(parts, ignore_index=True)
+
+
+def ledger_value(name: str, bankroll: float, fills: pd.DataFrame, sett: pd.DataFrame,
+                 marks: pd.DataFrame | None = None) -> float:
+    """
+    Portfolio value rebuilt from the trade records alone: bankroll - purchases + sales + rebates + payouts,
+    plus open bets at their latest mid (from `marks`: open_positions_marked rows) or, with no recent
+    price, at what they cost. Used when a strategy has no recent equity row (retired, or the bot is off).
+    """
+    f = fills[fills.strategy == name] if len(fills) else fills
+    cash = bankroll
+    if len(f):
+        cash += np.where(f["side"] == "BUY", -(f["usd"] + f["fee"]), f["usd"] - f["fee"]).sum()
+        cash += f["rebate"].fillna(0).sum() if "rebate" in f else 0.0
+    if len(sett):
+        cash += sett.loc[sett.strategy == name, "payout"].sum()
+    if marks is not None and len(marks):
+        m = marks[marks.strategy == name]
+        cash += np.where(m["value"].notna(), m["value"], m["net_cost"]).sum()
+    return float(cash)
+
+
 def leaderboard(d: dict[str, pd.DataFrame]) -> pd.DataFrame:
     strat, fills, sett, eq = d["strategies"], d["fills"], d["settlements"], d["equity"]
     status = d.get("status")
     stopped = set(status["name"]) if status is not None and len(status) else set()
     us = d.get("exchange") == "polymarket_us"
+    closed = closed_rounds(fills, sett)
+    latest_eq = eq["ts"].max() if len(eq) else None
+    marks = None                       # open bets at the latest mid, only needed for stale strategies
     rows = []
     for _, s in strat.iterrows():
         name, bankroll = s["name"], s["bankroll"]
         f = fills[fills.strategy == name] if len(fills) else fills
-        st = sett[sett.strategy == name] if len(sett) else sett
+        st = closed[closed.strategy == name] if len(closed) else closed      # finished trades
         e = eq[eq.strategy == name].sort_values("ts") if len(eq) else eq
 
-        pnl = st["pnl"] if len(st) else pd.Series(dtype=float)
+        pnl = st["pnl"].astype(float) if len(st) else pd.Series(dtype=float)
         n = len(pnl)
         mean = pnl.mean() if n else 0.0
         std = pnl.std(ddof=1) if n > 1 else float("nan")
@@ -141,7 +195,14 @@ def leaderboard(d: dict[str, pd.DataFrame]) -> pd.DataFrame:
         settled_slugs = set(st["slug"]) if len(st) else set()
         bought_settled = buys.loc[buys.slug.isin(settled_slugs), "usd"].sum() if len(buys) else 0.0
         bought = buys["usd"].sum() if len(buys) else 0.0
-        equity_now = e["equity"].iloc[-1] if len(e) else bankroll
+        # The bot's own value (cash + open bets at the mid) while it keeps recording this strategy; a
+        # retired strategy's last row is frozen from before its final rounds paid out, so rebuild it.
+        if len(e) and latest_eq is not None and latest_eq - e["ts"].iloc[-1] <= 120:
+            equity_now = e["equity"].iloc[-1]
+        else:
+            if marks is None:
+                marks = open_positions_marked(d)
+            equity_now = ledger_value(name, bankroll, fills, sett, marks)
         if d.get("max_dd") is not None:
             max_dd = d["max_dd"].get(name, 0.0) or 0.0
         elif len(e):
@@ -255,8 +316,10 @@ def pnl_by_hour(d) -> pd.DataFrame:
 
 
 def realized_timeline(d) -> pd.DataFrame:
-    """Cumulative realized P&L per strategy over time (one point per settlement)."""
-    s = d["settlements"]
+    """Cumulative realized P&L per strategy over time (one point per finished trade, see closed_rounds)."""
+    s = closed_rounds(d["fills"], d["settlements"])
+    if len(s):
+        s["time"] = _to_time(s["ts"])
     if not len(s):
         return s.assign(cum_pnl=pd.Series(dtype=float))     # same columns when nothing has settled yet
     s = s.sort_values("ts").copy()
@@ -390,7 +453,7 @@ def price_path(db_path: str, slug: str, t0: float, t1: float) -> pd.DataFrame:
 def summary(d) -> pd.DataFrame:
     """
     The headline table: one row per strategy, plain-English columns.
-    'Trades' = positions that have finished (their round resolved).
+    'Trades' = finished trades: rounds that resolved, plus rounds the strategy fully exited early.
     """
     lb = leaderboard(d)
     if not len(lb):

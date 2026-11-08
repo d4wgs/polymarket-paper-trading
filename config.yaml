@@ -151,6 +151,59 @@ strategies:
       snipe_seconds: 60
       stake_usd: 25
 
+  # ---- S3 v3 variants (2026-11-08). v2 above stays unchanged as the CONTROL. v2's live result: 169 trades,
+  # -$196; the 39 trades that paid under 70c lost $306 because the lagged index said "winning" while the market
+  # disagreed. Each variant below has its own bankroll (`class:` = which strategy code it runs).
+  s3_sniper_v3a:
+    class: s3_sniper
+    enabled: true
+    name: s3_sniper_v3a_floor50
+    title: "S3a · Sniper, market agrees (ask ≥ 50c)"
+    description: "Sniper v2 + only buys if the winning side's ask is ≥ 50c (the market also thinks it's ahead)."
+    markets: [5m, 15m]
+    params:
+      snipe_seconds: 60
+      min_price: 0.50
+      stake_usd: 25
+
+  s3_sniper_v3b:
+    class: s3_sniper
+    enabled: true
+    name: s3_sniper_v3b_floor70
+    title: "S3b · Sniper, market confident (ask ≥ 70c)"
+    description: "Sniper v2 + only buys if the winning side's ask is ≥ 70c."
+    markets: [5m, 15m]
+    params:
+      snipe_seconds: 60
+      min_price: 0.70
+      stake_usd: 25
+
+  s3_sniper_v3c:
+    class: s3_sniper
+    enabled: true
+    name: s3_sniper_v3c_floor70_cap97
+    title: "S3c · Sniper, 70c–97c band"
+    description: "Sniper v3b + skips asks above 97c (a win pays < 3c there, one loss erases dozens of wins)."
+    markets: [5m, 15m]
+    params:
+      snipe_seconds: 60
+      min_price: 0.70
+      max_price: 0.97
+      stake_usd: 25
+
+  s3_sniper_v3d:
+    class: s3_sniper
+    enabled: true
+    name: s3_sniper_v3d_model_floor50
+    title: "S3d · Sniper, live-spot model signal"
+    description: "Decides 'winning' with the fair-value model (live spot, settlement averaging) instead of the lagged index; ask ≥ 50c."
+    markets: [5m, 15m]
+    params:
+      snipe_seconds: 60
+      signal: model
+      min_price: 0.50
+      stake_usd: 25
+
   s4_momentum:
     enabled: true
     name: s4_momentum_v1
@@ -175,6 +228,66 @@ strategies:
         max_entry: 0.85
         entry_window_seconds: 10
         stake_usd: 25
+
+  # ---- S4 variants (2026-11-08). s4_momentum_v1 above is unchanged (control). Offline replay of v1 on the
+  # logged ticks: confirmation filters 79.2% wins / +$0.68 per trade vs 78.0% / +$0.49 for just buying every
+  # favorite >= 70c -- so most of S4 is "buy the favorite"; these test which tweak (if any) adds to it.
+  s4_momentum_min80:
+    class: s4_momentum
+    enabled: true
+    name: s4_momentum_min80_v1
+    title: "S4·80 · Momentum, side ≥ 80c"
+    description: "S4 but the crowd must price the side ≥ 80c (the 80–90c entries had the best margin over breakeven)."
+    markets: [5m, 15m]
+    params:
+      min_side_price: 0.80
+      max_entry: 0.90
+      skip_first_seconds: 30
+      skip_last_seconds: 10
+      stake_usd: 25
+
+  s4_momentum_edge:
+    class: s4_momentum
+    enabled: true
+    name: s4_momentum_edge0_v1
+    title: "S4·E · Momentum, model edge ≥ 0"
+    description: "S4 but also requires the fair-value model to see non-negative edge after fees."
+    markets: [5m, 15m]
+    params:
+      min_side_price: 0.70
+      max_entry: 0.90
+      min_edge: 0.0
+      skip_first_seconds: 30
+      skip_last_seconds: 10
+      stake_usd: 25
+
+  s4_momentum_15m:
+    class: s4_momentum
+    enabled: true
+    name: s4_momentum_15m_v1
+    title: "S4·15 · Momentum, 15m only"
+    description: "S4 on 15-minute rounds only (15m made $1.24/trade vs $0.39 on 5m)."
+    markets: [15m]
+    params:
+      min_side_price: 0.70
+      max_entry: 0.90
+      skip_first_seconds: 30
+      skip_last_seconds: 10
+      stake_usd: 25
+
+  s4b_minute_buckets_v2:
+    class: s4b_minute_buckets
+    enabled: true
+    name: s4b_minute_buckets_v2
+    title: "S4b v2 · One-minute buckets, market agrees"
+    description: "S4b + only buys if the side's mid is ≥ 50c (v1 lost 5 of 5 buying 2–35c sides)."
+    markets: [5m]
+    params:
+      buckets: 3
+      max_entry: 0.85
+      entry_window_seconds: 10
+      min_side_price: 0.50
+      stake_usd: 25
 
   s5_complete_set:
     enabled: true
