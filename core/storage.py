@@ -13,6 +13,7 @@ Tables
   windows     - each round's exchange slug and "price to beat" (Up/Down open value)
   strategy_status - when a strategy hit its stop level and stopped trading (survives restarts)
   meta        - which exchange / fee model this database was recorded with
+  market_stats - volume / open interest / last trade of each round (the "stats" block of REST book polls)
   events      - strategy diagnostics that aren't trades (near-misses, failed legs, signals skipped)
 
 Every fill also records the model's view at entry: fair value of the side traded, edge after fees,
@@ -65,6 +66,11 @@ CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT);
 CREATE TABLE IF NOT EXISTS events (
     ts REAL, strategy TEXT, asset TEXT, slug TEXT, kind TEXT, data TEXT);
 CREATE INDEX IF NOT EXISTS ix_events ON events(strategy, kind, ts);
+CREATE TABLE IF NOT EXISTS market_stats (
+    ts REAL, asset TEXT, slug TEXT, seconds_left REAL,
+    open_px REAL, low_px REAL, high_px REAL, last_px REAL, last_qty REAL,
+    shares_traded REAL, notional_traded REAL, open_interest REAL, exchange_ts REAL);
+CREATE INDEX IF NOT EXISTS ix_mstats ON market_stats(slug, ts);
 """
 
 # columns added after the first release: (table, column, type) -- added to older databases on open
@@ -204,6 +210,13 @@ class Storage:
         self.db.execute("INSERT INTO books VALUES (?,?,?,?,?,?,?,?)",
                         (s.ts, s.market.asset, s.market.slug, s.seconds_left,
                          lv(s.up.bids), lv(s.up.asks), lv(s.down.bids), lv(s.down.asks)))
+
+    def log_stats(self, ts, asset, slug, seconds_left, st: dict):
+        """Cumulative volume / open interest of the round, as reported by the exchange's REST book poll."""
+        self.db.execute("INSERT INTO market_stats VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                        (ts, asset, slug, seconds_left, st.get("open_px"), st.get("low_px"), st.get("high_px"),
+                         st.get("last_px"), st.get("last_qty"), st.get("shares_traded"),
+                         st.get("notional_traded"), st.get("open_interest"), st.get("exchange_ts")))
 
     def prune_books(self, before_ts: float, batch: int = 20_000) -> int:
         """

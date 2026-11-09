@@ -108,6 +108,13 @@ streamlit run dashboard.py                   # http://localhost:8501
 
 Restarting `run.py` resumes cash and open positions from the database. **Raspberry Pi:** copy the project (without `.venv` and `data`), run `bash deploy/raspberry-pi/setup.sh` (it installs `requirements.txt`, which now includes `pyyaml` and `websockets`).
 
+## Disk, backups and secrets
+
+- **Retention.** The raw order-book log (`books`, ~50 MB/day) is trimmed to `engine.books_keep_days` (default 3) every 10 minutes; freed pages are reused, so the DB file stops growing once the window is full. Compact tables (`snapshots`, `fills`, `settlements`, `equity`, `market_stats`) are kept.
+- **Backups.** `tools/backup_db.sh` (Pi, cron 03:30) makes a consistent gzip copy of the DB in `data/backups/` (3 kept). `tools/pull_backup.ps1` (Windows, scheduled task `PolymarketPiBackup`, register with `-Register`) triggers it and copies the result to `~/polymarket-backups` (14 kept). Older order books therefore live on in those off-Pi copies.
+- **Volume stats.** Each REST book poll carries the market's `stats` (shares/notional traded, open interest, high/low/last). They're stored in `market_stats` whenever they change (30 s heartbeat).
+- **API keys never go in git.** Put `POLYMARKET_US_API_KEY` (and `..._SECRET`) in the environment or a gitignored `.env` (see `.env.example`); read them via `core/credentials.py`. Paper trading needs no key today.
+
 ## Honest limitations
 
 - **The oracle feed is slow, and settlement is an average (measured 2026-11-07).** The BRTI series we can read from Polymarket US trails Coinbase spot by ~30–35 seconds, and the market rules settle on the *average of 60 BRTI prints in the final minute* (K is the same kind of average). So the model uses **spot as S** (`model.s_source: spot`) and **models the 60-second averaging** (`model.settlement_average_seconds: 60`). The spec's original point formula on the oracle is `s_source: oracle`, `settlement_average_seconds: 0` (give strategies new names if you switch). The oracle is still logged every tick and still drives the basis kill switch and the sniper's basis filter, but because of its lag, basis readings during fast moves are mostly delay, not disagreement.

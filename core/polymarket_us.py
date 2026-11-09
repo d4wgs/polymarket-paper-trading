@@ -85,6 +85,21 @@ def parse_book(data: dict) -> tuple[Optional[Book], Optional[Book], Optional[str
     return up, down, md.get("state")
 
 
+def parse_stats(data: dict) -> Optional[dict]:
+    """The round's volume stats from a /book response (cumulative since the round opened), or None."""
+    md = (data or {}).get("marketData") or {}
+    st = md.get("stats")
+    if not isinstance(st, dict):
+        return None
+
+    def num(x):
+        return _amount(x)
+    return {"open_px": num(st.get("openPx")), "low_px": num(st.get("lowPx")), "high_px": num(st.get("highPx")),
+            "last_px": num(st.get("lastTradePx")), "last_qty": num(st.get("lastTradeQty")),
+            "shares_traded": num(st.get("sharesTraded")), "notional_traded": num(st.get("notionalTraded")),
+            "open_interest": num(st.get("openInterest")), "exchange_ts": _iso_ts(md.get("transactTime"))}
+
+
 class PolymarketUSFeed:
     def __init__(self, window_seconds: int = 900, timeout: float = 4.0, attempts: int = 2):
         self.window_seconds = window_seconds
@@ -98,6 +113,7 @@ class PolymarketUSFeed:
         self._index_cache: dict[str, tuple[float, Optional[float]]] = {}
         self._prefix_cfg: dict[str, dict] = {}
         self._book_miss_log: dict[str, float] = {}
+        self.last_stats: dict[str, dict] = {}                # internal slug -> latest parse_stats() of its book poll
 
     # ---------- low level ----------
     def _session(self) -> requests.Session:
@@ -209,6 +225,9 @@ class PolymarketUSFeed:
                          info.asset, info.exchange_slug)
             return None, None
         up, down, state = parse_book(data)
+        stats = parse_stats(data)
+        if stats is not None:
+            self.last_stats[info.slug] = stats
         if state != "MARKET_STATE_OPEN":
             return None, None              # pre-open, halted, expired...: nothing can trade
         return up, down
@@ -265,6 +284,6 @@ class PolymarketUSFeed:
         return self.resolution_detail(slug, window_end)[0]
 
     def prune(self, before_ts: float):
-        for d in (self._market_cache, self._exchange_slug, self._miss_until, self._ptb_try):
+        for d in (self._market_cache, self._exchange_slug, self._miss_until, self._ptb_try, self.last_stats):
             for k in [k for k in d if (slug_start(k) or 0) < before_ts]:
                 del d[k]

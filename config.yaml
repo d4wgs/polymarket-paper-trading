@@ -92,7 +92,10 @@ engine:
   settle_max_lookups: 6
   provisional_recheck_seconds: 60
   book_levels_logged: 10
-  books_keep_days: 30                 # null = keep raw order books forever
+  # Disk plan: the raw order-book log (`books`) is ~half of all DB growth (~50 MB/day), so only the last
+  # few days are kept in full. Everything compact (top-of-book `snapshots`, fills, settlements, equity,
+  # market_stats) is kept. The nightly backup (tools/backup_db.sh) is what preserves older books.
+  books_keep_days: 3                  # null = keep raw order books forever
   export_dir: data/exports            # daily CSV of all trades: trades_YYYY-MM-DD.csv (ET day)
   db_path: null                       # null = data/paper_us.db (US) or data/paper.db (intl)
 

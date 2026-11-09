@@ -2,3 +2,18 @@
 __pycache__/
 *.pyc
 data/
+
+# secrets: never commit
+.env
+.env.*
+!.env.example
+*.key
+*.pem
+secrets.env
+
+# local DB backups
+backups/
+*.db
+*.db-wal
+*.db-shm
+*.sqlite3

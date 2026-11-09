@@ -633,5 +633,26 @@ class LongRunningTests(unittest.TestCase):
         store.db.close()
 
 
+class MarketStatsTests(unittest.TestCase):
+    def test_parse_stats_and_log(self):
+        import tempfile, os
+        from core.polymarket_us import parse_stats
+        from core.storage import Storage
+        data = {"marketData": {"transactTime": "2026-11-09T17:13:07.373262418Z", "stats": {
+            "openPx": {"value": "0.4100"}, "lowPx": {"value": "0.0100"}, "highPx": {"value": "0.4600"},
+            "lastTradePx": {"value": "0.0100"}, "lastTradeQty": "1.7800", "sharesTraded": "45739.5100",
+            "notionalTraded": {"value": "9024.2636"}, "openInterest": "11435.5800"}}}
+        st = parse_stats(data)
+        self.assertEqual(st["shares_traded"], 45739.51)
+        self.assertEqual(st["open_interest"], 11435.58)
+        self.assertIsNone(parse_stats({"marketData": {}}))
+        d = tempfile.mkdtemp()
+        store = Storage(os.path.join(d, "t.db"))
+        store.log_stats(1.0, "BTC-15m", "btc-updown-15m-1", 600, st)
+        row = store.db.execute("SELECT * FROM market_stats").fetchone()
+        self.assertEqual(row["notional_traded"], 9024.2636)
+        store.db.close()
+
+
 if __name__ == "__main__":
     unittest.main()

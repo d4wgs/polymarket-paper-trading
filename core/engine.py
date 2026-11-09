@@ -77,6 +77,7 @@ class Engine:
         self._warned: dict[str, float] = {}                                  # slug -> last "still unresolved" warning
         self.marks: dict[str, tuple] = {}                                    # slug -> (up_mid, down_mid)
         self._last_equity = self._last_settle = self._last_status = self._last_book_prune = 0.0
+        self._stats_last: dict[str, tuple] = {}                              # slug -> ((shares, OI), logged at)
         self.skipped_ticks = 0                                               # ticks dropped: inconsistent books
         self.stopped: dict[str, dict] = {}                                   # strategy -> stop record
         self._windows_logged: set[str] = set()                               # slugs whose price-to-beat is saved
@@ -179,6 +180,18 @@ class Engine:
         self._daily_export(now)
         self.store.commit()
 
+    def _log_stats(self, info, now: float):
+        """Record the exchange's volume stats for the round when they change (or every 30s as a heartbeat)."""
+        stats = (getattr(self.feed, "last_stats", None) or {}).get(info.slug)
+        if not stats:
+            return
+        key = (stats.get("shares_traded"), stats.get("open_interest"))
+        last = self._stats_last.get(info.slug)
+        if last and last[0] == key and now - last[1] < 30:
+            return
+        self._stats_last[info.slug] = (key, now)
+        self.store.log_stats(now, info.asset, info.slug, info.window_end - now, stats)
+
     def _prune_books(self, now: float):
         """Keep the raw order-book log (the biggest table by far) to BOOKS_KEEP_DAYS so the disk can't fill."""
         days = self._setting("BOOKS_KEEP_DAYS", None)
@@ -214,6 +227,7 @@ class Engine:
             self._windows_logged.add(info.slug)
         self.store.log_snapshot(snap)
         self.store.log_book(snap, self._setting("BOOK_LEVELS_LOGGED", 10))
+        self._log_stats(info, now)
         self.marks[info.slug] = (up.mid, down.mid)
         self._run_followups(info.slug, fv, now)
 
@@ -675,6 +689,7 @@ class Engine:
         if self.md is not None:
             self.md.prune(now - 600)
         self._reject_logged = {k: v for k, v in self._reject_logged.items() if now - v < 3600}
+        self._stats_last = {k: v for k, v in self._stats_last.items() if _slug_start(k) >= cutoff}
 
     def _check_stop(self, name: str, broker: PaperBroker, now: float) -> bool:
         """
