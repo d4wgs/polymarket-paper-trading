@@ -105,6 +105,7 @@ class WsStore:
         self._uncommitted = 0
         self._last_commit = clock()
         self._last_prune = 0.0
+        self._last_gc = 0.0
         self.stored = {"book": 0, "trade": 0, "dup_trade": 0, "skipped_book": 0}
 
     # ---------------------------------------------------------------------------- sink API
@@ -191,6 +192,12 @@ class WsStore:
     # ---------------------------------------------------------------------------- upkeep
     def _housekeeping(self, now: float):
         self._flush_pending(now)
+        if now - self._last_gc >= 600:               # forget slugs that have been quiet for an hour (rounds are over)
+            self._last_gc = now
+            for slug in [k for k, t in self._last_write.items() if now - t > 3600]:
+                self._last_write.pop(slug, None)
+                self._last_key.pop(slug, None)
+                self._pending.pop(slug, None)
         if self._uncommitted and (self._uncommitted >= 500 or now - self._last_commit >= 1.0):
             self.db.commit()
             self._uncommitted, self._last_commit = 0, now
