@@ -167,6 +167,14 @@ def ledger_value(name: str, bankroll: float, fills: pd.DataFrame, sett: pd.DataF
     return float(cash)
 
 
+def t_stat_of(pnl) -> float:
+    """mean / standard error of per-round P&L (NaN with < 2 rounds or zero spread). The leaderboard's t-stat."""
+    pnl = pd.Series(pnl, dtype=float)
+    n = len(pnl)
+    std = pnl.std(ddof=1) if n > 1 else float("nan")
+    return pnl.mean() / (std / math.sqrt(n)) if n > 1 and std and std > 0 else float("nan")
+
+
 def leaderboard(d: dict[str, pd.DataFrame]) -> pd.DataFrame:
     strat, fills, sett, eq = d["strategies"], d["fills"], d["settlements"], d["equity"]
     status = d.get("status")
@@ -185,8 +193,7 @@ def leaderboard(d: dict[str, pd.DataFrame]) -> pd.DataFrame:
         pnl = st["pnl"].astype(float) if len(st) else pd.Series(dtype=float)
         n = len(pnl)
         mean = pnl.mean() if n else 0.0
-        std = pnl.std(ddof=1) if n > 1 else float("nan")
-        t_stat = mean / (std / math.sqrt(n)) if n > 1 and std and std > 0 else float("nan")
+        t_stat = t_stat_of(pnl)
         gross_win, gross_loss = pnl[pnl > 0].sum(), -pnl[pnl < 0].sum()
 
         buys = f[f.side == "BUY"] if len(f) else f
