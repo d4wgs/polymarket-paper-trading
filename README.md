@@ -100,7 +100,7 @@ Trades are exported daily to `data/exports/trades_YYYY-MM-DD.csv` (ET day). On d
 python -m venv .venv
 .\.venv\Scripts\Activate.ps1
 pip install -r requirements.txt
-python -m unittest discover -s tests -v      # 106 tests
+python -m unittest discover -s tests -v      # 157 tests
 python tools/simulate.py --hours 24          # offline smoke test -> data/sim_us.db
 python run.py                                # the bot (Ctrl+C to stop)
 streamlit run dashboard.py                   # http://localhost:8501
@@ -121,7 +121,7 @@ Restarting `run.py` resumes cash and open positions from the database. **Raspber
 
 What a 30-minute probe showed (`python tools/ws_recorder.py --probe 1800` writes the raw messages to `data/ws_probe.jsonl`): book messages are **full snapshots**, not deltas (about 100 levels a side, ~8 KB, 5-10 per second per market, nearly every one different); trade messages are one print each with a unique `id`; the exchange sends no heartbeats. So the recorder keeps the top 10 levels plus stats, skips unchanged content and limits rows to one per market per 500 ms, and keeps **every** trade print.
 
-Tables in `ws_events.db`: `ws_book` (recv_ts, exch_ts, slug, state, best bid/ask, top levels JSON, last price/qty, shares & notional traded, open interest, hi/lo), `ws_trades` (recv_ts, trade_ts, slug, trade_id unique, price, qty, maker/taker side, intent, outcome side, action, state), `ws_gaps` (a row on every connect/disconnect/stop: data between a `disconnect` and the next `connect` may be missing), `ws_meta`. Config: the `recorder:` block in `config.yaml` (retention days, `max_db_mb` size cap, disk usage is logged every `disk_log_seconds`). Reconnects use exponential backoff (HTTP 429 and rejected handshakes back off harder), subscriptions are re-sent on every connect, and a watchdog reconnects after `stale_seconds` of silence.
+Tables in `ws_events.db`: `ws_book` (recv_ts, exch_ts, slug, state, best bid/ask, top levels JSON, last price/qty, shares & notional traded, open interest, hi/lo), `ws_trades` (recv_ts, trade_ts, slug, trade_id unique, price, qty, maker/taker side, intent, outcome side, action, state), `ws_gaps` (a row on every connect/disconnect/stop: data between a `disconnect` and the next `connect` may be missing), `ws_meta`. Config: the `recorder:` block in `config.yaml`. **Retention and size cap** (`core/ws_trim.py`, runs every 10 minutes of data time): per-table retention (`book_keep_days`, `trades_keep_days`, 7 each, about 2.8 GB at today's rates of ~150 MB/day books and ~250 MB/day trades), plus a total cap `max_db_mb` over *all* recorded tables: when live data exceeds it, the oldest rows of `ws_book` and `ws_trades` are deleted in proportion to their size down to `trim_target_pct` of the cap. Rows newer than `min_keep_hours` (24) are never deleted, and `ws_gaps` / `ws_meta` markers never are; if the cap still cannot be met a `SIZE CAP CANNOT CONVERGE` error is logged. Deletes run in committed batches within `prune_budget_s`, then an incremental vacuum and `wal_checkpoint(TRUNCATE)` make the file and `-wal` actually shrink. An existing DB needs a one-time `python tools/db_convert_autovac.py --db data/ws_events.db` (recorder stopped) to enable `auto_vacuum=INCREMENTAL`; new DBs get it automatically. `python tools/ws_trim.py --db COPY.db --dry-run` shows what a pass would delete (test on a copy). Disk usage is logged every `disk_log_seconds`. Reconnects use exponential backoff (HTTP 429 and rejected handshakes back off harder), subscriptions are re-sent on every connect, and a watchdog reconnects after `stale_seconds` of silence.
 
 ## Replay (`tools/replay.py`)
 
@@ -137,6 +137,20 @@ python tools/replay.py --src X.db --days 1 --ws-trades data/ws_events.db  # make
 
 The report (trades, P&L, win rate, average entry, fees, t-stat) comes from `core/metrics.py`, the same code as the dashboard. Maker fills keep the conservative book trade-through rule unless `--ws-trades` is given (then a resting bid fills only on prints strictly through its price).
 `--self-check` replays a period the live bot already traded and diffs fills and P&L against the live `fills`; `--model-check` compares the replayed fair value with the recorded one tick by tick. Known approximations: a recording has a book every ~2 s, so the order-latency re-fetch uses the decision book (`--latency-book next` uses the next recorded one, which matched worse); spot history is the recorded per-tick spot; thresholds that sit exactly on a decision boundary can flip. Back-up databases (`~/polymarket-backups`) can be replayed too, and the order books older than `books_keep_days` only exist in those.
+
+## Holdout validation (`tools/validate.py`)
+
+"Does this strategy hold up out of sample?" Replays the recording (or reuses `--replay-db`), splits rounds **by time** (never random) into development and a holdout (newest `--holdout-days`, or `--holdout-frac` of rounds), and reports per strategy: trades, rounds, P&L, win rate, breakeven win rate (average entry plus fee per share), average entry, per-trade expectancy with a bootstrap 95% CI that resamples **rounds** (fills in a round are correlated; fixed `--seed`, `--boot-n`), fees and t-stat (same helper as the dashboard leaderboard).
+
+```
+python tools/validate.py --src data/paper_us.db --holdout-days 2 --dev-days 5          # development only
+python tools/validate.py --src data/paper_us.db --holdout-days 2 --reveal-holdout      # also the holdout (logged)
+python tools/validate.py --src X.db --strategies s3_sniper_v2 --markets 5m --export-json out.json --export-csv out.csv
+```
+
+The holdout is neither computed nor printed without `--reveal-holdout`; every reveal appends the date, strategies and a parameter hash to `data/holdout_reveals.log`, so you can see how often you have peeked. With many variants on the same data the header prints the variant count, a Bonferroni threshold and a best-of-N warning.
+
+**Replay-optimism caveat.** Replay fills against the decision-time book, while live fills hit a book fetched ~250 ms later, which is optimistic on thin books (self-check: `s3_sniper_v2` live -$349 vs replay -$236; 58 longshot rounds explain $132 of the $156 gap). Strategies with more than 25% of fills or of shares bought below $0.20 entry (or fills larger than the displayed best-ask depth) are marked **LOW CONFIDENCE ON DOLLARS**: trust win rate, sign and ranking, not dollars. Thresholds live in the `validate:` block of `config.yaml`.
 
 ## Honest limitations
 

@@ -108,10 +108,33 @@ recorder:
   stale_seconds: 90                   # no message at all for this long -> reconnect (watchdog; the exchange sends no heartbeats)
   book_levels: 10                     # price levels per side kept in ws_book (the feed sends ~100; they're full snapshots)
   book_min_interval_ms: 500           # at most one ws_book row per market per this long (changed content only)
-  book_keep_days: 2                   # ws_book kept this long ...
-  trades_keep_days: 14                # ... trade prints (small, the valuable part) this long
-  max_db_mb: 3000                     # hard cap: if the file is bigger, ws_book is trimmed to half the window
+  # Retention is per table. Observed rates: ws_book ~150 MB/day, ws_trades ~250 MB/day, so 7 + 7 days is ~2.8 GB.
+  book_keep_days: 7                   # ws_book kept this long
+  trades_keep_days: 7                 # ws_trades kept this long
+  max_db_mb: 3000                     # total cap over ALL recorded tables: oldest rows of ws_book AND ws_trades are
+                                      #   deleted in proportion to their size until live data <= trim_target_pct of it.
+                                      #   If nothing trimmable is left and it is still over, an ERROR is logged.
+  trim_target_pct: 90                 # a cap trim goes down to this % of max_db_mb (avoids trimming every pass)
+  min_keep_hours: 24                  # rows newer than this are NEVER deleted (retention or cap); gap markers never are
+  trim_batch_rows: 20000              # rows per delete batch (committed between batches)
+  prune_budget_s: 5                   # max seconds one housekeeping pass may block the recorder; leftovers continue later
+  vacuum_chunk_pages: 2000            # incremental_vacuum chunk (needs auto_vacuum; see tools/db_convert_autovac.py)
+  vacuum_pause_ms: 20                 # pause between vacuum chunks
+  vacuum_min_free_mb: 64              # only vacuum when at least this much is free inside the file
   disk_log_seconds: 600               # log DB size + free disk this often
+
+# ---------------------------------------------------------------- tools/validate.py (holdout validation)
+validate:
+  bootstrap_n: 2000                   # resamples (of ROUNDS) for the per-trade expectancy CI
+  seed: 12345
+  reveal_log: data/holdout_reveals.log
+  # "LOW CONFIDENCE ON DOLLARS" flag. Evidence: replay fills against the decision-time book, live fills against a
+  # book fetched ~250 ms later; self-check: s3_sniper_v2 live -$349 vs replay -$236, and 58 longshot rounds
+  # (entry < $0.20) explain $132 of the $156 gap. So a strategy is flagged when:
+  low_price_floor: 0.20               # ... more than low_price_share of its fills are below this entry price, or
+  low_price_share: 0.25               # (applies to the share of fills AND the share of shares bought)
+  depth_ratio: 1.0                    # ... more than depth_share of its fills are bigger than this x displayed best-ask depth
+  depth_share: 0.25
 
 # =====================================================================================
 #  PART B - STRATEGIES. Each one: enabled, its own name / bankroll / markets, and its params.

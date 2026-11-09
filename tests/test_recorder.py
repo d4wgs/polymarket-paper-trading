@@ -104,16 +104,152 @@ class WsStoreTests(unittest.TestCase):
         self.assertEqual([r[0] for r in self.rows("SELECT trade_id FROM ws_trades")], ["new"])
         self.assertEqual(self.rows("SELECT COUNT(*) FROM ws_book")[0][0], 1)
 
-    def test_size_cap_trims_books_not_trades(self):
-        st = self.store(book_keep_days=None, trades_keep_days=None, max_db_mb=0.001, book_min_interval_ms=0)
-        for i in range(400):
-            st.write(1000.0 + i, book_msg(shares=str(i), bids=[(f"0.{40 + i % 9}", str(i))]))
-        st.write(1.0, trade_msg("keep"))
+
+
+DAY = 86400.0
+NOW = 100 * DAY
+
+
+class SizeCapTests(unittest.TestCase):
+    """The cap must act on ALL recorded tables (the old one trimmed only ws_book and could never reach it)."""
+
+    def setUp(self):
+        self.dir = tempfile.mkdtemp()
+        self.path = os.path.join(self.dir, "ws.db")
+
+    def fill(self, st, days=10, trades_per_day=2500, books_per_day=500):
+        """Synthetic recording: trades dominate (like the real 250 MB vs 150 MB per day), newest data at NOW."""
+        pad = "x" * 40
+        tr, bk = [], []
+        for d in range(days):
+            base = NOW - (d + 1) * DAY + 1.0
+            for i in range(trades_per_day):
+                ts = base + i * (DAY - 2) / trades_per_day
+                tr.append((ts, ts, "slug", f"id{d}_{i}", 0.5, 1.0, "BUY", "BUY_LONG", "YES", "BUY", "SELL",
+                           "SELL_LONG", "YES", "SELL", "NEW"))
+            for i in range(books_per_day):
+                ts = base + i * (DAY - 2) / books_per_day
+                bk.append((ts, ts, "slug", "OPEN", 0.49, 0.51, "[[0.49,10.0]," + pad + "]", "[[0.51,5.0]]",
+                           2, 2, 0.5, 1.0, 100.0, 50.0, 40.0, 0.6, 0.4))
+        st.db.executemany("INSERT INTO ws_trades VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", tr)
+        st.db.executemany("INSERT INTO ws_book VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", bk)
+        for k, t in enumerate((NOW - 9 * DAY, NOW - 5 * DAY, NOW - 100.0)):
+            st.db.execute("INSERT INTO ws_gaps VALUES (?,?,?)", (t, ("connect", "disconnect", "stop")[k], "m"))
+        st.db.commit()
+
+    def q(self, st, sql):
+        return st.db.execute(sql).fetchall()
+
+    def mk(self, **cfg):
+        cfg.setdefault("book_keep_days", None)
+        cfg.setdefault("trades_keep_days", None)
+        cfg.setdefault("max_db_mb", 10_000)
+        cfg.setdefault("vacuum_pause_ms", 0)
+        cfg.setdefault("prune_budget_s", 600)
+        return WsStore(self.path, cfg)
+
+    def test_new_db_is_incremental_auto_vacuum(self):
+        self.assertEqual(self.mk().db.execute("PRAGMA auto_vacuum").fetchone()[0], 2)
+
+    def test_cap_converges_when_trades_alone_exceed_it_and_trims_both_tables(self):
+        st = self.mk()
+        self.fill(st)
+        live0 = st.trimmer.live_bytes()
+        trades0, books0 = self.q(st, "SELECT COUNT(*) FROM ws_trades")[0][0], self.q(st, "SELECT COUNT(*) FROM ws_book")[0][0]
+        st.policy.max_bytes = live0 * 0.5                      # half the data must go: more than ws_book holds alone
+        self.assertGreater(live0 * 0.5, 0)
+        st.prune(NOW)
+        self.assertLessEqual(st.trimmer.live_bytes(), st.policy.max_bytes)
+        trades1, books1 = self.q(st, "SELECT COUNT(*) FROM ws_trades")[0][0], self.q(st, "SELECT COUNT(*) FROM ws_book")[0][0]
+        self.assertLess(trades1, trades0)                      # the table the old cap ignored
+        self.assertLess(books1, books0)
+        # oldest-first: what is left is the newest data, and nothing inside the 24 h minimum was touched
+        recent = NOW - 86400.0
+        self.assertEqual(self.q(st, f"SELECT COUNT(*) FROM ws_trades WHERE recv_ts >= {recent}")[0][0], 2500)
+        self.assertEqual(self.q(st, f"SELECT COUNT(*) FROM ws_book WHERE recv_ts >= {recent}")[0][0], 500)
+        self.assertGreater(self.q(st, "SELECT MIN(recv_ts) FROM ws_trades")[0][0], NOW - 10 * DAY)
+
+    def test_markers_survive_everything(self):
+        st = self.mk(book_keep_days=1, trades_keep_days=1)
+        self.fill(st)
+        st.policy.max_bytes = 1.0                              # impossible cap: delete everything allowed
+        st.prune(NOW)
+        self.assertEqual([r[1] for r in self.q(st, "SELECT ts, kind FROM ws_gaps ORDER BY ts")],
+                         ["connect", "disconnect", "stop"])
+        self.assertEqual(self.q(st, "SELECT COUNT(*) FROM ws_meta WHERE key LIKE 'started_%'")[0][0], 1)
+
+    def test_never_deletes_rows_newer_than_min_keep_and_warns_loudly_when_it_cannot_converge(self):
+        st = self.mk(min_keep_hours=48)
+        self.fill(st, days=1)                                   # everything is inside the 48 h minimum
+        st.policy.max_bytes = 1.0
+        n = self.q(st, "SELECT (SELECT COUNT(*) FROM ws_trades), (SELECT COUNT(*) FROM ws_book)")[0]
+        with self.assertLogs("ws_trim", level="ERROR") as cm:
+            st.prune(NOW)
+        self.assertIn("CANNOT CONVERGE", cm.output[0])
+        self.assertEqual(self.q(st, "SELECT (SELECT COUNT(*) FROM ws_trades), (SELECT COUNT(*) FROM ws_book)")[0], n)
+
+    def test_warns_when_one_table_is_trimmed_to_its_floor_and_still_over(self):
+        st = self.mk()
+        self.fill(st, days=3)
+        st.policy.max_bytes = 1.0
+        st.prune(NOW)
+        res = st.trimmer.run(NOW)
+        self.assertEqual(self.q(st, f"SELECT COUNT(*) FROM ws_trades WHERE recv_ts < {NOW - DAY}")[0][0], 0)
+        self.assertTrue(any("still over" in w or "CANNOT" in w for w in res["warnings"]))
+
+    def test_file_and_wal_actually_shrink(self):
+        st = self.mk()
+        self.fill(st)
+        st.db.commit()
+        size0 = os.path.getsize(self.path) + (os.path.getsize(self.path + "-wal") if os.path.exists(self.path + "-wal") else 0)
+        st.policy.max_bytes = st.trimmer.live_bytes() * 0.4
+        st.policy.vacuum_min_free_bytes = 0
+        st.prune(NOW)
+        wal = os.path.getsize(self.path + "-wal") if os.path.exists(self.path + "-wal") else 0
+        size1 = os.path.getsize(self.path) + wal
+        self.assertLess(size1, size0 * 0.7)
+        self.assertLess(wal, 100_000)                           # checkpoint(TRUNCATE) emptied the -wal
+
+    def test_recorder_keeps_writing_during_and_after_a_budgeted_trim(self):
+        st = self.mk(prune_budget_s=0.0, trim_batch_rows=500)
+        self.fill(st)
+        st.policy.max_bytes = st.trimmer.live_bytes() * 0.5
+        passes = 0
+        while True:
+            st.prune(NOW)
+            passes += 1
+            st.write(NOW + passes, trade_msg(f"live{passes}"))  # the recorder writes between passes
+            st.flush()
+            if not st.trimmer.more or passes > 500:
+                break
+        self.assertGreater(passes, 2)                           # the budget really split it into several passes
+        self.assertLessEqual(st.trimmer.live_bytes(), st.policy.max_bytes)
+        self.assertEqual(self.q(st, "SELECT COUNT(*) FROM ws_trades WHERE trade_id LIKE 'live%'")[0][0], passes)
+        st.write(NOW + 999, trade_msg("after"))
         st.flush()
-        before = self.rows("SELECT COUNT(*) FROM ws_book")[0][0]
-        st.prune(5000.0)
-        self.assertLess(self.rows("SELECT COUNT(*) FROM ws_book")[0][0], before)
-        self.assertEqual(self.rows("SELECT COUNT(*) FROM ws_trades")[0][0], 1)
+        self.assertEqual(self.q(st, "SELECT COUNT(*) FROM ws_trades WHERE trade_id='after'")[0][0], 1)
+
+    def test_per_table_retention_and_min_keep_floor(self):
+        st = self.mk(book_keep_days=3, trades_keep_days=7, min_keep_hours=24)
+        self.fill(st)
+        st.prune(NOW)
+        self.assertGreaterEqual(self.q(st, "SELECT MIN(recv_ts) FROM ws_book")[0][0], NOW - 3 * DAY)
+        self.assertGreaterEqual(self.q(st, "SELECT MIN(recv_ts) FROM ws_trades")[0][0], NOW - 7 * DAY)
+        self.assertLess(self.q(st, "SELECT MIN(recv_ts) FROM ws_trades")[0][0], NOW - 3 * DAY)   # trades kept longer
+        st2 = self.mk(book_keep_days=0.1, trades_keep_days=0.1, min_keep_hours=24)               # keep < min_keep
+        st2.prune(NOW)
+        self.assertGreaterEqual(self.q(st2, "SELECT MIN(recv_ts) FROM ws_trades")[0][0], NOW - DAY)
+
+    def test_dry_run_plan_is_read_only(self):
+        st = self.mk()
+        self.fill(st)
+        st.close()
+        from core.ws_trim import Policy, plan
+        before = os.path.getsize(self.path)
+        out = plan(self.path, Policy(max_bytes=1e5), NOW)
+        self.assertEqual(os.path.getsize(self.path), before)
+        self.assertEqual(out["markers"], 3)
+        self.assertGreater(out["tables"]["ws_trades"]["cap_deletes"], 0)
 
 
 class FakeWS:
