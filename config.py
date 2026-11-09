@@ -18,6 +18,7 @@ from strategies.s3_sniper import Sniper
 from strategies.s4_momentum import CrowdMomentum, MinuteBuckets
 from strategies.s5_complete_set import CompleteSetArb
 from strategies.s6_mean_reversion import ShockReversion
+from strategies.s7_nested_pair import NestedPair
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 CONFIG_PATH = os.environ.get("PAPER_CONFIG") or os.path.join(HERE, "config.yaml")
@@ -31,6 +32,7 @@ REGISTRY = {
     "s4b_minute_buckets": MinuteBuckets,      # configured as s4_momentum.variant_4b
     "s5_complete_set": CompleteSetArb,
     "s6_mean_reversion": ShockReversion,
+    "s7_nested_pair": NestedPair,
 }
 
 WINDOW_LENGTHS = {"5m": 300, "15m": 900, "1h": 3600}
@@ -92,13 +94,13 @@ STOP_EQUITY = _port.get("stop_equity", 200)
 POLL_SECONDS = _eng.get("poll_seconds", 2)
 WINDOW_SECONDS = 900
 EQUITY_EVERY_SECONDS = _eng.get("equity_every_seconds", 5)
+EQUITY_HEARTBEAT_SECONDS = _eng.get("equity_heartbeat_seconds", 60)
 SETTLE_CHECK_SECONDS = _eng.get("settle_check_seconds", 15)
 SETTLE_WARN_SECONDS = _eng.get("settle_warn_seconds", 3600)
 SETTLE_MAX_LOOKUPS = _eng.get("settle_max_lookups", 6)
 PROVISIONAL_RECHECK_SECONDS = _eng.get("provisional_recheck_seconds", 60)
 BOOK_LEVELS_LOGGED = _eng.get("book_levels_logged", 10)
 BOOKS_KEEP_DAYS = _eng.get("books_keep_days", 3)
-RECORDER = RAW.get("recorder", {}) or {}
 RECORDER = RAW.get("recorder", {}) or {}
 EXPORT_DIR = _eng.get("export_dir", "data/exports")
 DB_PATH = _eng.get("db_path") or ("data/paper_us.db" if EXCHANGE == "polymarket_us" else "data/paper.db")

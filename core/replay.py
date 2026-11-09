@@ -18,6 +18,9 @@ How a recorded tick is replayed: the bot logged one (snapshot, book) row per mar
 its clock after the fetch. Replay groups those rows into ticks (a market appears once per tick), sets the clock
 to each row's timestamp as the engine "fetches" it, and lets the engine do everything else.
 
+  WsBookReader  OPTIONAL (latency_book="ws"): the order-latency book rebuilt from the recorded websocket book
+                snapshots (data/ws_events.db) as of decision time + latency
+
 Known approximations (they are why the self-check exists; see tools/replay.py):
   * the live bot fetched a FRESH book `latency` (250 ms) after each taker decision. A recording only has a book
     every ~2 s, so the follow-up book is the next recorded one (`latency_book="next"`) or the decision book
@@ -29,6 +32,7 @@ Known approximations (they are why the self-check exists; see tools/replay.py):
 from __future__ import annotations
 
 import bisect
+import dataclasses
 import json
 import sqlite3
 import types
@@ -151,11 +155,86 @@ class Source:
         return n
 
 
+class WsBookReader:
+    """
+    The book as of an arbitrary time T, from the recorder's `ws_book` table (read-only handle).
+
+    What the recorder learned (core/ws_store.py): MARKET_DATA messages are FULL SNAPSHOTS, not deltas, so there is
+    nothing to apply: the book at T is simply the newest stored snapshot with recv_ts <= T (a snapshot whose kept
+    content did not change is not stored again, and rows are throttled to one per market per `book_min_interval_ms`,
+    so the state can be up to that interval behind). Only the top `book_levels` levels are kept, like the bot's own
+    `books` table. ws_book is the YES (UP) instrument; the DOWN book is its mirror: DOWN bids = 1 - UP offers,
+    DOWN asks = 1 - UP bids.
+
+    A latency book is refused (the caller falls back to the decision-time book) when
+      * no snapshot exists at or before T for the market      ("no_row")
+      * the newest one is older than `max_age` seconds         ("stale")
+      * a recorder gap overlaps [snapshot time, T]: from a `disconnect`/`stop` marker to the next `connect`, or a
+        `bad_json` marker (a lost message)                     ("gap")
+      * the book is crossed, has a price outside (0, 1), or both sides are empty   ("invalid")
+    """
+
+    def __init__(self, ws_path: str, max_age: float = 60.0):
+        self.db = sqlite3.connect(f"file:{ws_path}?mode=ro", uri=True)
+        self.max_age = max_age
+        self.gaps = self._load_gaps()                       # [(start, end)], end = inf while still down
+        self.first_ts = (self.db.execute("SELECT MIN(recv_ts) FROM ws_book").fetchone() or [None])[0]
+        self.last_ts = (self.db.execute("SELECT MAX(recv_ts) FROM ws_book").fetchone() or [None])[0]
+
+    def _load_gaps(self) -> list:
+        rows = self.db.execute("SELECT ts, kind FROM ws_gaps ORDER BY ts").fetchall()
+        gaps, down_since = [], None
+        for ts, kind in rows:
+            if kind in ("disconnect", "stop"):
+                if down_since is None:
+                    down_since = ts
+            elif kind == "connect":
+                if down_since is not None:
+                    gaps.append((down_since, ts))
+                    down_since = None
+            elif kind == "bad_json":
+                gaps.append((ts, ts))
+        if down_since is not None:
+            gaps.append((down_since, float("inf")))
+        return gaps
+
+    def _gap_between(self, a: float, b: float) -> bool:
+        return any(g0 <= b and a <= g1 for g0, g1 in self.gaps)
+
+    def book_at(self, exch_slug: str, t: float):
+        """(up_book, down_book, age, None) or (None, None, None, reason)."""
+        r = self.db.execute("SELECT recv_ts, bids, offers FROM ws_book WHERE slug = ? AND recv_ts <= ? "
+                            "ORDER BY recv_ts DESC LIMIT 1", (exch_slug, t)).fetchone()
+        if r is None:
+            return None, None, None, "no_row"
+        ts, bids_j, offers_j = r
+        if t - ts > self.max_age:
+            return None, None, None, "stale"
+        if self._gap_between(ts, t):
+            return None, None, None, "gap"
+        bids = [(float(p), float(q)) for p, q in json.loads(bids_j or "[]") if q and q > 0]
+        offers = [(float(p), float(q)) for p, q in json.loads(offers_j or "[]") if q and q > 0]
+        if not bids and not offers:
+            return None, None, None, "invalid"
+        if any(not (0.0 < p < 1.0) for p, _ in bids + offers):
+            return None, None, None, "invalid"
+        if bids and offers and bids[0][0] >= offers[0][0]:
+            return None, None, None, "invalid"
+        up = Book(bids=bids, asks=offers)
+        mirror = lambda side: [(round(1.0 - p, 4), q) for p, q in side]
+        down = Book(bids=mirror(offers), asks=mirror(bids))
+        return up, down, t - ts, None
+
+
 class ReplayFeed:
     """The engine's `feed`, answering from the recording."""
 
-    def __init__(self, src: Source, clock: ReplayClock, markets: list[dict], latency_book: str = "same"):
-        self.src, self.clock, self.latency_book = src, clock, latency_book
+    def __init__(self, src: Source, clock: ReplayClock, markets: list[dict], latency_book: str = "same",
+                 ws_books: Optional["WsBookReader"] = None):
+        if latency_book == "ws" and ws_books is None:
+            raise ValueError('latency_book="ws" needs the websocket recording (ws_book_path)')
+        self.src, self.clock, self.latency_book, self.ws_books = src, clock, latency_book, ws_books
+        self.latency_log: list[tuple] = []     # (ts, slug, source, reason, age): one row per order-latency fetch
         self.by_asset = {m["asset"]: m for m in markets}
         self.pending: dict[str, Ev] = {}       # asset -> the recorded tick being replayed
         self.last_event: Optional[Ev] = None   # what the spot feed reads
@@ -202,6 +281,16 @@ class ReplayFeed:
 
     def _follow_up(self, info: MarketInfo) -> Ev:
         base = self.last_event
+        if self.latency_book == "ws":
+            w = self.src.windows.get(info.slug)
+            exch = (w[3] if w and w[3] else info.slug)
+            up, down, age, why = self.ws_books.book_at(exch, self.clock.t)    # clock = decision time + latency
+            if up is not None:
+                self.latency_log.append((self.clock.t, info.slug, "ws", None, age))
+                return dataclasses.replace(base, up_bids=[list(x) for x in up.bids], up_asks=[list(x) for x in up.asks],
+                                           down_bids=[list(x) for x in down.bids], down_asks=[list(x) for x in down.asks])
+            self.latency_log.append((self.clock.t, info.slug, "no-latency-book", why, None))
+            return base                                      # fall back to the decision-time book
         if self.latency_book == "next":
             nxt = self.src.next_event(info.asset, self.clock.t)
             if nxt is not None and nxt.slug == info.slug:
@@ -340,7 +429,9 @@ def make_strategies(config_module):
 
 def run_replay(config_module, src_path: str, out_path: str, t0: float, t1: float, *, only: Optional[list] = None,
                ws_path: Optional[str] = None, sigma_mode: str = "recorded", latency_book: str = "same",
-               progress=None, keep_snapshots: bool = False, warm_start: bool = True) -> Engine:
+               progress=None, keep_snapshots: bool = False, warm_start: bool = True,
+               ws_book_path: Optional[str] = None, latency_ms: Optional[float] = None,
+               ws_book_max_age: float = 60.0) -> Engine:
     """Replay recorded ticks in [t0, t1) into `out_path`. The source is opened read-only."""
     import os
     if os.path.abspath(out_path) == os.path.abspath(src_path):
@@ -351,9 +442,12 @@ def run_replay(config_module, src_path: str, out_path: str, t0: float, t1: float
     cfg = types.SimpleNamespace(**{k: getattr(config_module, k) for k in dir(config_module) if k.isupper()})
     cfg.DB_PATH = out_path
     cfg.EXPORT_DIR = None
+    if latency_ms is not None:                      # replay-only override (calibration sweep); the live bot is untouched
+        cfg.LATENCY_SECONDS = float(latency_ms) / 1000.0
     src = Source(src_path)
     clock = ReplayClock(t0)
-    feed = ReplayFeed(src, clock, cfg.MARKETS, latency_book)
+    ws_books = WsBookReader(ws_book_path, ws_book_max_age) if latency_book == "ws" and ws_book_path else None
+    feed = ReplayFeed(src, clock, cfg.MARKETS, latency_book, ws_books)
     strategies = make_strategies(config_module)
     if only:
         strategies = [s for s in strategies if s.name in only]
@@ -389,9 +483,17 @@ def run_replay(config_module, src_path: str, out_path: str, t0: float, t1: float
             progress(n, clock.t)
     clock.t = max(clock.t, t1) + 3600            # let the last rounds settle
     engine.settle_finished(clock.t)
-    engine.record_equity(clock.t)
+    engine.record_equity(clock.t, force=True)
     engine.store.commit()
+    if latency_book == "ws":                      # which latency fetches hit a websocket book and which fell back
+        engine.store.db.execute("CREATE TABLE IF NOT EXISTS latency_books (ts REAL, slug TEXT, source TEXT, "
+                                "reason TEXT, age REAL)")
+        engine.store.db.executemany("INSERT INTO latency_books VALUES (?,?,?,?,?)", feed.latency_log)
+        engine.store.commit()
+    engine.latency_log = feed.latency_log
     engine.store.db.close()                       # results are complete; callers read the file
     src.db.close()
+    if ws_books is not None:
+        ws_books.db.close()
     engine.ticks_replayed = n
     return engine

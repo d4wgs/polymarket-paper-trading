@@ -86,7 +86,8 @@ portfolio:
 # ---------------------------------------------------------------- engine
 engine:
   poll_seconds: 2                     # Polymarket US allows 25 requests/s per IP
-  equity_every_seconds: 5
+  equity_every_seconds: 5             # how often account values are checked; a row is saved only when the value
+  equity_heartbeat_seconds: 60        # changed, plus one row per strategy this often (keeps the table small)
   settle_check_seconds: 15
   settle_warn_seconds: 3600
   settle_max_lookups: 6
@@ -123,6 +124,10 @@ recorder:
   vacuum_min_free_mb: 64              # only vacuum when at least this much is free inside the file
   disk_log_seconds: 600               # log DB size + free disk this often
 
+# ---------------------------------------------------------------- replay options
+replay:
+  ws_book_max_age_s: 60               # --latency-book ws: a websocket book older than this at decision+latency is not used (fallback)
+
 # ---------------------------------------------------------------- tools/validate.py (holdout validation)
 validate:
   bootstrap_n: 2000                   # resamples (of ROUNDS) for the per-trade expectancy CI
@@ -143,7 +148,8 @@ validate:
 # =====================================================================================
 strategies:
   s1_fair_value:
-    enabled: true
+    enabled: false                    # 2026-11-09: hit the $200 stop (-$816 in 92 rounds) and can never trade again
+                                      # under this name. To run it again, change `name` and set enabled: true.
     name: s1_fair_value_v2            # v2 (2026-11-07): model shrunk toward the market, stale-quote guards
     title: "S1 · Fair-value trader"
     description: "Buys a side when model+market fair value beats the ask by 4c after fees; skips jumps, huge gaps, longshots."
@@ -165,7 +171,7 @@ strategies:
       exit_threshold: 0.03
 
   s2_market_maker:
-    enabled: true
+    enabled: false                    # 2026-11-09: hit the $200 stop (-$821 in 52 rounds); new `name` to run again
     name: s2_market_maker_v1
     title: "S2 · Market maker"
     description: "Rests bids on both sides around fair value, skewed by inventory; fills only on trade-through."
@@ -330,7 +336,7 @@ strategies:
       stake_usd: 25
 
   s5_complete_set:
-    enabled: true
+    enabled: false                    # 2026-11-09: hit the $200 stop (-$847, $755 of it fees); new `name` to run again
     name: s5_complete_set_v2          # v2 (2026-11-07): legged-in set with take profit / stop loss / time exit
     title: "S5 · Complete set (legged)"
     description: "15s in, buys the pricier side; buys the opposite leg when leg 1's price is +10% or -5%, or at 30s left."
@@ -359,3 +365,40 @@ strategies:
       gap_close_frac: 0.5
       time_stop_seconds: 60
       stake_usd: 25
+
+  # ---- S7 (2026-11-09): the 15m round and the 5m round that close together settle on the same BRTI average,
+  # so 15m UP + 5m DOWN (or the mirror, depending on which price to beat is higher) always pays >= $1.
+  # Recorded books 11-07 -> 11-09: only 4 of 175 pairs were ever <= $0.99 all-in -> expect rare, small trades.
+  s7_nested_pair:
+    enabled: true
+    name: s7_nested_pair_v1
+    title: "S7 · Nested 5m/15m pair (locked)"
+    description: "Buys 15m Up + 5m Down (or the mirror) when the two cost <= 99c together after fees: pays >= $1, $2 if the close lands between the two prices to beat."
+    markets: [5m, 15m]                # needs BOTH: each leg is bought on its own market's tick
+    params:
+      max_pair_cost: 0.99
+      complete_slack: 0.03            # leg 2 allowed up to opening limit + 3c
+      leg1_market: 5m                 # leg 1 on the 5m tick; leg 2 on the 15m tick right after
+      max_other_age_seconds: 3
+      min_seconds_left: 5
+      min_pair_shares: 5
+      stake_usd: 50                   # for the whole pair (about half per leg)
+
+  s7_nested_pair_ev:
+    class: s7_nested_pair
+    enabled: true
+    name: s7_nested_pair_ev_v1
+    title: "S7·EV · Nested pair, band EV"
+    description: "S7 + also opens when 1 + model P(close between the two prices to beat) - pair cost >= 2c, up to $1.05 per pair. Not riskless."
+    markets: [5m, 15m]
+    params:
+      max_pair_cost: 0.99
+      band_ev: true
+      min_ev: 0.02
+      max_ev_pair_cost: 1.05
+      complete_slack: 0.03            # leg 2 allowed up to opening limit + 3c
+      leg1_market: 5m                 # leg 1 on the 5m tick; leg 2 on the 15m tick right after
+      max_other_age_seconds: 3
+      min_seconds_left: 5
+      min_pair_shares: 5
+      stake_usd: 50

@@ -134,7 +134,7 @@ def main():
         engine.run()
     except KeyboardInterrupt:
         logging.info("Stopped. Data saved to %s", config.DB_PATH)
-        engine.record_equity(engine.clock())
+        engine.record_equity(engine.clock(), force=True)
         engine.store.commit()
 
 

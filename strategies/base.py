@@ -41,6 +41,11 @@ Model / market data (core/fairvalue.py):
   ctx.quotes                  -> {outcome: Quote} this strategy's resting maker bids in this round
   ctx.bid(outcome, price, shares) / ctx.cancel(outcome=None)  -> maker orders
   ctx.event(kind, **data)     -> record a diagnostic row (table `events`)
+
+Other markets (read-only; orders still only go to THIS market):
+  ctx.others                  -> {asset: OtherMarket} the latest snapshot of every other configured market
+                                 (e.g. "BTC-15m" while ticking "BTC-5m") and this strategy's position in it.
+                                 OtherMarket: .snap (Snapshot, check .snap.ts for its age) .position (Position)
 """
 from __future__ import annotations
 
@@ -50,6 +55,13 @@ from typing import Optional
 from core.models import BUY, CANCEL, MAKER_BID, SELL, UP, Book, Order, Position, Settlement, Snapshot
 
 MIN_PRICE, MAX_PRICE = 0.001, 0.999   # Polymarket's price range (its smallest tick is 0.001)
+
+
+@dataclass
+class OtherMarket:
+    """Another market's latest snapshot and this strategy's holdings in it (read-only)."""
+    snap: Snapshot
+    position: Position
 
 
 @dataclass
@@ -69,6 +81,7 @@ class TickContext:
     entries_this_window: int = 0
     kill_switch: bool = False
     events: list = field(default_factory=list)  # (kind, data) recorded by ctx.event()
+    others: dict = field(default_factory=dict)  # asset -> OtherMarket (latest snapshot of the other markets)
 
     # handy shortcuts
     @property
@@ -181,12 +194,15 @@ class TickContext:
         return self.position.up > 1e-9 or self.position.down > 1e-9
 
     def buy(self, outcome: str, usd: Optional[float] = None, shares: Optional[float] = None,
-            max_price: Optional[float] = None, reason: str = "", then=None, **meta) -> Order:
-        """Market-style buy that won't pay above max_price (default: best ask + 2c, capped at 0.999)."""
+            max_price: Optional[float] = None, reason: str = "", then=None, hedge: bool = False,
+            **meta) -> Order:
+        """Market-style buy that won't pay above max_price (default: best ask + 2c, capped at 0.999).
+        hedge=True: this buy completes a position held in another market (see Order.hedge)."""
         if max_price is None and self.book(outcome).best_ask is not None:
             # Near 0 and 1 Polymarket trades in 0.001 steps, so the cap must allow 0.991-0.999.
             max_price = min(MAX_PRICE, self.book(outcome).best_ask + 0.02)
-        return Order(outcome, BUY, usd=usd, shares=shares, limit=max_price, reason=reason, then=then, meta=meta)
+        return Order(outcome, BUY, usd=usd, shares=shares, limit=max_price, reason=reason, then=then, meta=meta,
+                     hedge=hedge)
 
     def sell(self, outcome: str, shares: Optional[float] = None,
              min_price: Optional[float] = None, reason: str = "", **meta) -> Order:

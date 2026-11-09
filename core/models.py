@@ -130,6 +130,9 @@ class Order:
     then: optional callable(fills) -> Order | None, run after another latency delay against a freshly
           fetched book (multi-leg orders, e.g. complete-set arbitrage).
     meta: extra numbers the strategy wants recorded with the fill (e.g. the signal that fired).
+    hedge: True for a BUY that completes a position this strategy already holds in ANOTHER market (e.g. the
+          second leg of a cross-market pair). It reduces risk, so the kill switch and the open-markets limit
+          don't block it (the dollar caps still apply). The engine only honours it while such a position exists.
     """
     outcome: Optional[str]  # UP or DOWN (None only for a cancel-all)
     side: str               # BUY or SELL
@@ -140,6 +143,7 @@ class Order:
     kind: str = TAKER
     then: Optional[Callable[[list], Optional["Order"]]] = None
     meta: dict = field(default_factory=dict)
+    hedge: bool = False
 
 
 @dataclass

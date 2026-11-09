@@ -60,14 +60,17 @@ class RiskManager:
 
     # ------------------------------------------------------------- per order
     def check_buy(self, strategy: str, *, usd: Optional[float], shares: Optional[float], price: Optional[float],
-                  market_cost: float, open_markets: int, in_this_market: bool, equity: float) -> RiskDecision:
+                  market_cost: float, open_markets: int, in_this_market: bool, equity: float,
+                  hedge: bool = False) -> RiskDecision:
         """
         usd/shares: the order's size (one of them); price: its limit (to convert shares to dollars).
         market_cost: dollars already at risk in this round; open_markets: rounds with a position.
+        hedge: the order completes a position held in another market (it reduces risk), so the kill
+               switch and the open-markets limit don't apply; the dollar caps still do.
         """
-        if self.kill_active:
+        if self.kill_active and not hedge:
             return RiskDecision(False, reason="kill switch (basis / feed)")
-        if self.max_open is not None and not in_this_market and open_markets >= self.max_open:
+        if self.max_open is not None and not hedge and not in_this_market and open_markets >= self.max_open:
             return RiskDecision(False, reason=f"max open markets ({self.max_open})")
         px = price if price and price > 0 else 1.0
         want = usd if usd is not None else (shares or 0.0) * px

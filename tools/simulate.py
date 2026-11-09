@@ -175,7 +175,7 @@ def main():
     engine = Engine(cfg, strategies, feed, Storage(args.db), clock=clock.now, sleep=clock.sleep, market_data=md)
     engine.run(max_seconds=args.hours * 3600 + 120)
     engine.settle_finished(clock.now() + 3600)
-    engine.record_equity(clock.now())
+    engine.record_equity(clock.now(), force=True)
     engine.store.commit()
 
     print(f"\nSimulated {args.hours:g}h -> {args.db}")

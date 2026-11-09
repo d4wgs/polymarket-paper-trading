@@ -25,10 +25,10 @@ from collections import defaultdict
 from core.broker import PaperBroker
 from core.fees import ET, et_day, fee_model_name, make_fee_model
 from core.maker import MakerBook
-from core.models import CANCEL, MAKER_BID, Order, Snapshot, UP, DOWN, books_consistent
+from core.models import CANCEL, MAKER_BID, Order, Position, Snapshot, UP, DOWN, books_consistent
 from core.risk import RiskManager
 from core.storage import Storage
-from strategies.base import Strategy, TickContext
+from strategies.base import OtherMarket, Strategy, TickContext
 
 log = logging.getLogger("engine")
 
@@ -82,6 +82,8 @@ class Engine:
         self.stopped: dict[str, dict] = {}                                   # strategy -> stop record
         self._windows_logged: set[str] = set()                               # slugs whose price-to-beat is saved
         self._last_skip_log = 0.0
+        self.latest: dict[str, Snapshot] = {}                                # asset -> its latest snapshot
+        self._equity_last: dict[str, tuple] = {}                             # strategy -> (cash, open value, saved at)
 
     def _setting(self, name, default):
         return getattr(self.cfg, name, default)
@@ -153,7 +155,7 @@ class Engine:
             except Exception:
                 log.exception("Tick failed; continuing")
             self.sleep(max(0.0, self.cfg.POLL_SECONDS - (self.clock() - t0)))
-        self.record_equity(self.clock())
+        self.record_equity(self.clock(), force=True)
         self.store.commit()
 
     def tick(self, now: float):
@@ -229,6 +231,7 @@ class Engine:
         self.store.log_book(snap, self._setting("BOOK_LEVELS_LOGGED", 10))
         self._log_stats(info, now)
         self.marks[info.slug] = (up.mid, down.mid)
+        self.latest[asset] = snap
         self._run_followups(info.slug, fv, now)
 
         new_window = self.current_slug.get(asset) != info.slug
@@ -268,7 +271,8 @@ class Engine:
                               md=self.md,
                               quotes=self.maker.for_market(s.name, info.slug),
                               entries_this_window=broker.entries.get(info.slug, 0),
-                              kill_switch=self.risk.kill_active)
+                              kill_switch=self.risk.kill_active,
+                              others=self._others(broker, asset))
             try:
                 if new_window:
                     s.on_window_start(ctx)
@@ -321,6 +325,18 @@ class Engine:
             pending = chained
             if exec_snap is not None:
                 snap = exec_snap
+                self.latest[asset] = snap
+
+    def _others(self, broker, asset: str) -> dict:
+        """Read-only view of the other markets for a strategy: latest snapshot + its position there."""
+        out = {}
+        for a, sn in self.latest.items():
+            if a == asset:
+                continue
+            m = sn.market
+            pos = broker.positions.get(m.slug) or Position(m.asset, m.slug, m.window_end)  # never stored
+            out[a] = OtherMarket(sn, pos)
+        return out
 
     # ------------------------------------------------------------------ data / model
     def _fetch_books(self, info, now):
@@ -405,9 +421,14 @@ class Engine:
                 return order                         # buying the other side = closing
         open_markets = sum(1 for p in broker.positions.values() if p.up > 1e-9 or p.down > 1e-9)
         in_market = pos is not None and (pos.up > 1e-9 or pos.down > 1e-9)
+        # A hedge completes a position held in ANOTHER market (e.g. leg 2 of a cross-market pair). Blocking it
+        # would leave that leg naked, so the kill switch / open-markets limit don't apply -- but only while
+        # such a position really exists (a strategy can't use the flag to open fresh risk).
+        hedge = bool(getattr(order, "hedge", False)) and any(
+            slug != m.slug and (p.up > 1e-9 or p.down > 1e-9) for slug, p in broker.positions.items())
         dec = self.risk.check_buy(s.name, usd=order.usd, shares=order.shares, price=order.limit,
                                   market_cost=pos.net_cost if pos else 0.0, open_markets=open_markets,
-                                  in_this_market=in_market, equity=broker.equity(self.marks))
+                                  in_this_market=in_market, equity=broker.equity(self.marks), hedge=hedge)
         if not dec.ok:
             key = (s.name, m.slug, dec.reason)
             if snap.ts - self._reject_logged.get(key, 0.0) >= 60:     # one event per minute per reason
@@ -418,8 +439,31 @@ class Engine:
             return None
         if dec.reason == "clipped":
             order = Order(order.outcome, order.side, usd=dec.usd, shares=dec.shares, limit=order.limit,
-                          reason=order.reason, kind=order.kind, then=order.then, meta=order.meta)
+                          reason=order.reason, kind=order.kind, then=order.then, meta=order.meta,
+                          hedge=getattr(order, "hedge", False))
         return order
+
+    def _log_unfilled(self, s, order, dsnap, exec_snap):
+        """
+        A taker order that passed the risk check but got no fill (the price moved past its limit during the
+        latency, or the book was empty). Recorded as an `order_unfilled` event so the fill rate can be measured;
+        at most one per strategy / round / side every 10s (orders that are retried every tick would flood it).
+        """
+        m = exec_snap.market
+        key = (s.name, m.slug, "unfilled", order.outcome, order.side)
+        if exec_snap.ts - self._reject_logged.get(key, 0.0) < 10:
+            return
+        self._reject_logged[key] = exec_snap.ts
+
+        def touch(snap):
+            book = snap.up if order.outcome == UP else snap.down
+            return book.best_ask if order.side == "BUY" else book.best_bid
+        self.store.log_event(exec_snap.ts, s.name, m.asset, m.slug, "order_unfilled",
+                             {"outcome": order.outcome, "side": order.side, "usd": order.usd,
+                              "shares": order.shares, "limit": order.limit,
+                              "decision_px": touch(dsnap), "exec_px": touch(exec_snap),
+                              "latency": round(exec_snap.ts - dsnap.ts, 3),
+                              "seconds_left": round(exec_snap.seconds_left, 1), "reason": order.reason})
 
     def _execute_taker(self, s, broker, order, dsnap, exec_snap, books):
         checked = self._risk_check(s, broker, order, exec_snap)
@@ -430,6 +474,8 @@ class Engine:
         except Exception:
             log.exception("Strategy %s sent a bad order %s; skipped", s.name, order)
             return []
+        if not fills:
+            self._log_unfilled(s, checked, dsnap, exec_snap)
         for fill in fills:
             fill.meta = self._fill_meta(fill, dsnap, dsnap.ts, extra=order.meta)
             self.store.log_fill(fill)
@@ -710,9 +756,21 @@ class Engine:
         log.warning("[%s] STOPPED trading: %s. Open bets will still settle.", name, reason)
         return True
 
-    def record_equity(self, now: float):
+    def record_equity(self, now: float, force: bool = False):
+        """
+        Save each strategy's account value -- only when it changed since its last saved row, plus a heartbeat
+        row every EQUITY_HEARTBEAT_SECONDS (60) so the dashboard can tell the bot is alive. Most strategies are
+        flat most of the time: writing every row made this table ~25 MB/day, 83% of it exact repeats.
+        """
+        heartbeat = self._setting("EQUITY_HEARTBEAT_SECONDS", 60)
         for name, b in self.brokers.items():
-            self.store.log_equity(now, name, b.cash, b.open_value(self.marks))
+            cash, open_value = b.cash, b.open_value(self.marks)
+            last = self._equity_last.get(name)
+            if (not force and last is not None and now - last[2] < heartbeat
+                    and abs(cash - last[0]) < 1e-9 and abs(open_value - last[1]) < 1e-9):
+                continue
+            self._equity_last[name] = (cash, open_value, now)
+            self.store.log_equity(now, name, cash, open_value)
 
     def _print_status(self):
         parts = []
