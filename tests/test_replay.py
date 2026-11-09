@@ -106,6 +106,30 @@ class ReplayEndToEnd(unittest.TestCase):
             run_replay(config, self.src, self.src, self.t0, self.t1, only=NAMES)
         self.assertEqual(digest(self.src), before)
 
+    def test_warm_start_restores_live_state_and_cold_start_does_not(self):
+        mid = self.t0 + (self.t1 - self.t0) / 2
+        live = sqlite3.connect(self.src)
+        before = live.execute("SELECT COUNT(*) FROM fills WHERE strategy=? AND ts < ?", (NAMES[1], mid)).fetchone()[0]
+        live.close()
+        self.assertGreater(before, 0)
+        cfg = types.SimpleNamespace(**{k: getattr(config, k) for k in dir(config) if k.isupper()})
+        cfg.LATENCY_SECONDS = 0.0
+        out = os.path.join(self.dir, "warm.db")
+        warm = run_replay(cfg, self.src, out, mid, self.t1 + 1, only=NAMES, warm_start=True)
+        c = sqlite3.connect(out)
+        self.assertEqual(c.execute("SELECT COUNT(*) FROM fills WHERE strategy=? AND ts < ?", (NAMES[1], mid)).fetchone()[0], before)
+        c.close()
+        cold = run_replay(cfg, self.src, os.path.join(self.dir, "cold.db"), mid, self.t1 + 1, only=NAMES, warm_start=False)
+        c = sqlite3.connect(os.path.join(self.dir, "cold.db"))
+        self.assertEqual(c.execute("SELECT COUNT(*) FROM fills WHERE ts < ?", (mid,)).fetchone()[0], 0)
+        c.close()
+        # warm start carries the live cash at `mid`; cold start begins from the bankroll
+        live = sqlite3.connect(self.src)
+        spent = live.execute("SELECT COALESCE(SUM(CASE WHEN side='BUY' THEN -(usd+fee) ELSE usd-fee END),0) FROM fills "
+                             "WHERE strategy=? AND ts < ?", (NAMES[1], mid)).fetchone()[0]
+        live.close()
+        self.assertNotEqual(round(spent, 2), 0.0)
+
     def test_unknown_strategy_is_an_error(self):
         with self.assertRaises(ValueError):
             run_replay(config, self.src, os.path.join(self.dir, "x.db"), self.t0, self.t1, only=["nope"])
@@ -116,6 +140,19 @@ class ReplayEndToEnd(unittest.TestCase):
         self.assertEqual(c.now(), 100.25)
         c.sleep(-5)
         self.assertEqual(c.now(), 100.25)
+
+
+class WsStoreGc(unittest.TestCase):
+    def test_quiet_slug_state_is_forgotten(self):
+        from core.ws_store import WsStore
+        st = WsStore(os.path.join(tempfile.mkdtemp(), "w.db"), {})
+        st._last_key["old"], st._last_write["old"] = ("k",), 0.0
+        st._last_key["new"], st._last_write["new"] = ("k",), 9999.0
+        st._housekeeping(10000.0)
+        self.assertNotIn("old", st._last_key)
+        self.assertNotIn("old", st._last_write)
+        self.assertIn("new", st._last_key)
+        st.close()
 
 
 class GroupTicks(unittest.TestCase):

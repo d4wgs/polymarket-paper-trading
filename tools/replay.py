@@ -165,6 +165,8 @@ def main():
     ap.add_argument("--sigma", choices=["recorded", "ewma"], default="recorded")
     ap.add_argument("--latency-book", choices=["next", "same"], default="same",
                     help="book used for the order latency fill: the next recorded one, or the decision book")
+    ap.add_argument("--cold-start", action="store_true",
+                    help="start every strategy fresh at its bankroll (default: restore the live state as of the start)")
     ap.add_argument("--model-check", action="store_true",
                     help="also compare the replayed fair value with the recorded one, tick by tick")
     ap.add_argument("--self-check", action="store_true", help="compare with the live fills in the source DB")
@@ -191,7 +193,7 @@ def main():
         print(f"  ... {n} ticks, at {dt.datetime.fromtimestamp(t, dt.timezone.utc):%m-%d %H:%M}", flush=True)
     engine = run_replay(config, args.src, args.out, t0, t1, only=names, ws_path=args.ws_trades,
                         sigma_mode=args.sigma, latency_book=args.latency_book, progress=prog,
-                        keep_snapshots=args.model_check)
+                        keep_snapshots=args.model_check, warm_start=not args.cold_start)
     print(f"replayed {engine.ticks_replayed} ticks -> {args.out}")
     open_left = [(n, len(b.positions)) for n, b in engine.brokers.items() if b.positions]
     if open_left:

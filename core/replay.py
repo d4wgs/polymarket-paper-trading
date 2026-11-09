@@ -119,6 +119,38 @@ class Source:
         out.commit()
 
 
+    def copy_state(self, out: sqlite3.Connection, t0: float, names: Optional[list] = None) -> dict:
+        """
+        Warm start: copy what the live bot had done BEFORE t0 (fills, settlements, stop records) into the
+        replay DB, so Engine.setup() restores each strategy's real cash, open positions and stopped state
+        exactly like a live restart does. Without it every strategy starts fresh at its bankroll, and
+        strategies that had already lost money (or been stopped) behave differently from the live run.
+        """
+        out_cols = lambda t: [r[1] for r in out.execute(f"PRAGMA table_info({t})")]
+        n = {}
+        for table, tscol in (("fills", "ts"), ("settlements", "ts")):
+            src_cols = {r[1] for r in self.db.execute(f"PRAGMA table_info({table})")}
+            cols = [c for c in out_cols(table) if c in src_cols]
+            q = f"SELECT {','.join(cols)} FROM {table} WHERE {tscol} < ?"
+            args = [t0]
+            if names:
+                q += f" AND strategy IN ({','.join('?' * len(names))})"
+                args += names
+            rows = self.db.execute(q, args).fetchall()
+            out.executemany(f"INSERT INTO {table} ({','.join(cols)}) VALUES ({','.join('?' * len(cols))})", rows)
+            n[table] = len(rows)
+        q = "SELECT name, stopped_at, equity, reason FROM strategy_status WHERE stopped_at < ?"
+        args = [t0]
+        if names:
+            q += f" AND name IN ({','.join('?' * len(names))})"
+            args += names
+        rows = self.db.execute(q, args).fetchall()
+        out.executemany("INSERT OR REPLACE INTO strategy_status VALUES (?,?,?,?)", rows)
+        n["stopped"] = len(rows)
+        out.commit()
+        return n
+
+
 class ReplayFeed:
     """The engine's `feed`, answering from the recording."""
 
@@ -308,7 +340,7 @@ def make_strategies(config_module):
 
 def run_replay(config_module, src_path: str, out_path: str, t0: float, t1: float, *, only: Optional[list] = None,
                ws_path: Optional[str] = None, sigma_mode: str = "recorded", latency_book: str = "same",
-               progress=None, keep_snapshots: bool = False) -> Engine:
+               progress=None, keep_snapshots: bool = False, warm_start: bool = True) -> Engine:
     """Replay recorded ticks in [t0, t1) into `out_path`. The source is opened read-only."""
     import os
     if os.path.abspath(out_path) == os.path.abspath(src_path):
@@ -335,6 +367,10 @@ def run_replay(config_module, src_path: str, out_path: str, t0: float, t1: float
     store = ReplayStorage(out_path)
     store.keep_snapshots = keep_snapshots
     src.copy_resolutions(store.db, t0 - 6 * 3600, t0)
+    if warm_start:
+        # restrict to the strategies being replayed (all configured ones when `only` is not given)
+        engine_names = [s.name for s in strategies]
+        src.copy_state(store.db, t0, engine_names)
     engine = Engine(cfg, strategies, feed, store, clock=clock.now, sleep=clock.sleep, market_data=md)
     if ws_path:
         def exch_of(slug):
