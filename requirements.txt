@@ -5,4 +5,6 @@ streamlit>=1.50
 plotly>=5.20
 tzdata>=2024.1
 pyyaml>=6.0
-websockets>=12.0
+websockets==17.4
+polymarket-us==2.4.1      # official SDK: its auth module signs the recorder's websocket handshake
+PyNaCl==1.6.2              # Ed25519 (dependency of polymarket-us)

@@ -98,6 +98,8 @@ SETTLE_MAX_LOOKUPS = _eng.get("settle_max_lookups", 6)
 PROVISIONAL_RECHECK_SECONDS = _eng.get("provisional_recheck_seconds", 60)
 BOOK_LEVELS_LOGGED = _eng.get("book_levels_logged", 10)
 BOOKS_KEEP_DAYS = _eng.get("books_keep_days", 3)
+RECORDER = RAW.get("recorder", {}) or {}
+RECORDER = RAW.get("recorder", {}) or {}
 EXPORT_DIR = _eng.get("export_dir", "data/exports")
 DB_PATH = _eng.get("db_path") or ("data/paper_us.db" if EXCHANGE == "polymarket_us" else "data/paper.db")
 

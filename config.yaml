@@ -99,6 +99,20 @@ engine:
   export_dir: data/exports            # daily CSV of all trades: trades_YYYY-MM-DD.csv (ET day)
   db_path: null                       # null = data/paper_us.db (US) or data/paper.db (intl)
 
+# ---------------------------------------------------------------- websocket recorder (separate process)
+# python tools/ws_recorder.py   (systemd: polymarket-recorder). Needs PM_KEY_ID / PM_SECRET_KEY (see .env.example).
+recorder:
+  db_path: data/ws_events.db          # its own file: can never lock or bloat paper_us.db
+  next_rounds: 1                      # also subscribe the NEXT n rounds of every configured market
+  debounce: false                     # true = exchange batches book updates (fewer rows, coarser)
+  stale_seconds: 90                   # no message at all for this long -> reconnect (watchdog; the exchange sends no heartbeats)
+  book_levels: 10                     # price levels per side kept in ws_book (the feed sends ~100; they're full snapshots)
+  book_min_interval_ms: 500           # at most one ws_book row per market per this long (changed content only)
+  book_keep_days: 2                   # ws_book kept this long ...
+  trades_keep_days: 14                # ... trade prints (small, the valuable part) this long
+  max_db_mb: 3000                     # hard cap: if the file is bigger, ws_book is trimmed to half the window
+  disk_log_seconds: 600               # log DB size + free disk this often
+
 # =====================================================================================
 #  PART B - STRATEGIES. Each one: enabled, its own name / bankroll / markets, and its params.
 #  markets: list of round lengths it trades ([5m, 15m]); omit for all.
