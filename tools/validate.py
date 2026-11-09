@@ -36,6 +36,18 @@ def _csv_list(vals):
     return [n for x in (vals or []) for n in x.split(",") if n] or None
 
 
+def _ws_used(db_path):
+    """True when an existing replay output was produced with --latency-book ws (it has a latency_books table)."""
+    import sqlite3
+    try:
+        con = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+        n = con.execute("SELECT COUNT(*) FROM sqlite_master WHERE name='latency_books'").fetchone()[0]
+        con.close()
+        return bool(n)
+    except sqlite3.Error:
+        return False
+
+
 def strategy_params(names):
     """The config.yaml blocks of the strategies being validated (what a tuning change would alter)."""
     out = {}
@@ -53,6 +65,9 @@ def main(argv=None):
     ap.add_argument("--replay-db", help="analyse an existing replay output instead of replaying again")
     ap.add_argument("--out", default="data/validate_replay.db", help="where the replay result is written")
     ap.add_argument("--ws-db", nargs="?", const="data/ws_events.db", default=None, help="maker fills from ws trade prints")
+    ap.add_argument("--latency-book", choices=["same", "ws"], default="same",
+                    help="'ws': fill against order-latency books rebuilt from --ws-db (only valid where the recorder "
+                         "has data; falls back to the decision book at gaps). Default: decision-time book.")
     ap.add_argument("--days", type=float, help="replay only the last N days of the recording")
     ap.add_argument("--holdout-days", type=float, default=0)
     ap.add_argument("--holdout-frac", type=float, default=0, help="alternative: newest X (0-1) share of rounds")
@@ -85,17 +100,25 @@ def main(argv=None):
         t0, t1 = (max(lo, hi - span_days * 86400), hi + 1) if span_days else (lo, hi + 1)
         print(f"replaying {dt.datetime.fromtimestamp(t0, dt.timezone.utc):%Y-%m-%d %H:%M} -> "
               f"{dt.datetime.fromtimestamp(t1, dt.timezone.utc):%Y-%m-%d %H:%M} UTC (source read-only) ...", flush=True)
-        run_replay(config, args.src, args.out, t0, t1, only=names, ws_path=args.ws_db, warm_start=True)
+        ws_book = (args.ws_db or "data/ws_events.db") if args.latency_book == "ws" else None
+        eng = run_replay(config, args.src, args.out, t0, t1, only=names, ws_path=args.ws_db, warm_start=True,
+                         latency_book=args.latency_book, ws_book_path=ws_book)
+        if ws_book:
+            used = sum(1 for r in eng.latency_log if r[2] == "ws")
+            ws_share = used / max(len(eng.latency_log), 1)
+            print(f"latency fetches: {used} websocket books, {len(eng.latency_log) - used} fell back to the decision book")
         out_db = args.out
 
     d = metrics.load(out_db)
+    ws_mode = bool(args.latency_book == "ws" and not args.replay_db) or _ws_used(out_db)
     depth = None if args.no_depth else V.make_depth_lookup(args.src)
     rep = V.build_report(
         d["fills"], d["settlements"], strategies=names, markets=markets, holdout_days=args.holdout_days,
         dev_days=args.dev_days, holdout_frac=args.holdout_frac, reveal_holdout=args.reveal_holdout,
         n_boot=args.boot_n, seed=args.seed, depth_lookup=depth,
         price_floor=float(cfgv.get("low_price_floor", 0.20)), price_share=float(cfgv.get("low_price_share", 0.25)),
-        depth_ratio=float(cfgv.get("depth_ratio", 1.0)), depth_share=float(cfgv.get("depth_share", 0.25)))
+        depth_ratio=float(cfgv.get("depth_ratio", 1.0)), depth_share=float(cfgv.get("depth_share", 0.25)),
+        ws_latency_book=ws_mode)
 
     revealed = 0
     if rep["holdout_revealed"]:

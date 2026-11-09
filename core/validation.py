@@ -306,7 +306,9 @@ def render_header(rep: dict, reveal_count_: int = 0) -> str:
                  f"displayed best-ask depth. Evidence: {rep['evidence']}.")
     lines.append("  Flagged: " + OPTIMISM_CAVEAT)
     if rep.get("ws_latency_book"):
-        lines.append("  This run filled against websocket order-latency books (more realistic on thin books).")
+        lines.append("  This run filled against websocket order-latency books where the recorder had data (more realistic "
+                     "on thin books; fills in gaps and any period before 2026-11-09 13:19 local still use the decision "
+                     "book, so the flag above still applies to those).")
     else:
         lines.append("  This run used decision-time books (no websocket latency book).")
     lines.append("b/e win% = (avg entry price + fee per share): the win rate needed to break even on hold-to-settlement "

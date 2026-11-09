@@ -240,3 +240,163 @@ class LiveBehaviourUnchanged(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+# ---------------------------------------------------------------------------------- websocket latency book
+import json
+
+from core.replay import ReplayFeed, WsBookReader
+from core.ws_store import SCHEMA as WS_SCHEMA
+
+EXCH = "cpc-btc-updown-5m-1000"
+SLUG = "btc-updown-5m-1000"
+
+
+def make_ws_db(path, rows, gaps=()):
+    """rows: (recv_ts, bids, offers); gaps: (ts, kind)."""
+    c = sqlite3.connect(path)
+    c.executescript(WS_SCHEMA)
+    for ts, bids, offers in rows:
+        c.execute("INSERT INTO ws_book (recv_ts, slug, state, bids, offers) VALUES (?,?,?,?,?)",
+                  (ts, EXCH, "OPEN", json.dumps(bids), json.dumps(offers)))
+    for ts, kind in gaps:
+        c.execute("INSERT INTO ws_gaps VALUES (?,?,?)", (ts, kind, ""))
+    c.commit()
+    c.close()
+
+
+A = ([[0.40, 10.0]], [[0.45, 5.0]])
+B = ([[0.41, 20.0]], [[0.46, 6.0]])
+C = ([[0.42, 30.0]], [[0.47, 7.0]])
+
+
+class WsBookReaderTests(unittest.TestCase):
+    def setUp(self):
+        self.dir = tempfile.mkdtemp()
+        self.path = os.path.join(self.dir, "ws.db")
+
+    def reader(self, rows, gaps=(), **kw):
+        make_ws_db(self.path, rows, gaps)
+        return WsBookReader(self.path, **kw)
+
+    def test_picks_the_snapshot_in_force_at_decision_time_plus_latency(self):
+        r = self.reader([(100.0, *A), (100.3, *B), (100.8, *C)])
+        top = lambda t: r.book_at(EXCH, t)[0].bids[0][0]
+        self.assertEqual(top(100.0 + 0.100), 0.40)             # 100 ms: still A
+        self.assertEqual(top(100.0 + 0.250), 0.40)             # 250 ms: B only arrives at 300 ms
+        self.assertEqual(top(100.0 + 0.400), 0.41)             # 400 ms: B
+        self.assertEqual(top(100.0 + 0.600), 0.41)
+        self.assertEqual(top(100.0 + 0.900), 0.42)             # 900 ms: C
+        self.assertAlmostEqual(r.book_at(EXCH, 100.4)[2], 0.1)  # age of the snapshot used
+
+    def test_down_book_is_the_mirror_of_the_yes_book(self):
+        r = self.reader([(100.0, [[0.40, 10.0], [0.39, 4.0]], [[0.45, 5.0], [0.46, 8.0]])])
+        up, down, _, why = r.book_at(EXCH, 100.1)
+        self.assertIsNone(why)
+        self.assertEqual(up.bids, [(0.40, 10.0), (0.39, 4.0)])
+        self.assertEqual(up.asks, [(0.45, 5.0), (0.46, 8.0)])
+        self.assertEqual(down.bids, [(0.55, 5.0), (0.54, 8.0)])      # 1 - UP offers, best (highest) first
+        self.assertEqual(down.asks, [(0.60, 10.0), (0.61, 4.0)])     # 1 - UP bids, best (lowest) first
+
+    def test_gaps_overlapping_the_window_refuse_the_book(self):
+        r = self.reader([(100.0, *A), (100.7, *B)],
+                        gaps=[(100.1, "disconnect"), (100.5, "connect"), (200.0, "bad_json")])
+        self.assertIsNone(r.book_at(EXCH, 100.05)[3])                # before the gap: fine
+        self.assertEqual(r.book_at(EXCH, 100.3)[3], "gap")           # inside the disconnect
+        self.assertEqual(r.book_at(EXCH, 100.6)[3], "gap")           # newest row (100.0) predates the gap
+        self.assertIsNone(r.book_at(EXCH, 100.8)[3])                 # a snapshot arrived after the reconnect
+        self.assertEqual(r.book_at(EXCH, 100.8)[0].bids[0][0], 0.41)
+        r2 = self.reader([(300.0, *A)], gaps=[(250.0, "stop")])      # stopped and never reconnected
+        self.assertEqual(r2.gaps[-1][1], float("inf"))
+        self.assertEqual(r2.book_at(EXCH, 300.1)[3], "gap")
+
+    def test_invalid_stale_and_missing_books_are_refused(self):
+        r = self.reader([(100.0, [[0.50, 1.0]], [[0.45, 1.0]]), (300.0, *A)], max_age=30)
+        self.assertEqual(r.book_at(EXCH, 100.1)[3], "invalid")       # crossed
+        self.assertEqual(r.book_at(EXCH, 50.0)[3], "no_row")
+        self.assertEqual(r.book_at(EXCH, 340.0)[3], "stale")         # newest snapshot is 40 s old
+        self.assertEqual(r.book_at("other-slug", 300.1)[3], "no_row")
+
+
+class WsFeedTests(unittest.TestCase):
+    def setUp(self):
+        self.dir = tempfile.mkdtemp()
+        self.path = os.path.join(self.dir, "ws.db")
+        self.src = types.SimpleNamespace(windows={SLUG: ("BTC-5m", 1000, 1300, EXCH, None)})
+        self.info = types.SimpleNamespace(asset="BTC-5m", slug=SLUG)
+
+    def feed(self, rows, gaps=(), mode="ws"):
+        make_ws_db(self.path, rows, gaps)
+        clock = ReplayClock(0.0)
+        f = ReplayFeed(self.src, clock, [{"asset": "BTC-5m"}], mode, WsBookReader(self.path))
+        f.last_event = Ev(1, 100.0, "BTC-5m", SLUG, [[0.30, 1.0]], [[0.35, 1.0]], [[0.65, 1.0]], [[0.70, 1.0]],
+                          50000.0, 0.5, None, None)
+        return f, clock
+
+    def test_follow_up_uses_the_ws_book_at_decision_plus_latency_and_counts_it(self):
+        f, clock = self.feed([(99.0, *A), (100.3, *B)])
+        clock.t = 100.0 + 0.4                                         # the engine slept 400 ms
+        up, down = f.books(self.info)
+        self.assertEqual(up.bids[0], (0.41, 20.0))
+        self.assertEqual(down.asks[0][0], 0.59)
+        self.assertEqual([(r[2], r[3]) for r in f.latency_log], [("ws", None)])
+        self.assertEqual(f.last_event.spot, 50000.0)                  # spot / sigma still those of the decision tick
+
+    def test_gap_falls_back_to_the_decision_book_and_marks_it(self):
+        f, clock = self.feed([(99.0, *A)], gaps=[(99.5, "disconnect"), (100.2, "connect")])
+        clock.t = 100.25
+        up, _ = f.books(self.info)
+        self.assertEqual(up.bids[0], (0.30, 1.0))                     # the decision-time book
+        self.assertEqual([(r[2], r[3]) for r in f.latency_log], [("no-latency-book", "gap")])
+
+    def test_ws_mode_requires_the_recording(self):
+        with self.assertRaises(ValueError):
+            ReplayFeed(self.src, ReplayClock(0.0), [], "ws", None)
+
+
+class WsLatencyRegression(unittest.TestCase):
+    """The default (and 'same') behaviour is untouched, and ws mode with no usable ws data == the old behaviour."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.dir = tempfile.mkdtemp()
+        cls.src = os.path.join(cls.dir, "live.db")
+        record_simulation(cls.src, hours=1.5)
+        c = sqlite3.connect(cls.src)
+        cls.t0, cls.t1 = c.execute("SELECT MIN(ts), MAX(ts) FROM books").fetchone()
+        c.close()
+        cls.empty_ws = os.path.join(cls.dir, "ws_empty.db")
+        make_ws_db(cls.empty_ws, [])
+
+    def run_(self, name, **kw):
+        out = os.path.join(self.dir, name + ".db")
+        run_replay(config, self.src, out, self.t0, self.t1 + 1, only=NAMES, latency_ms=250, **kw)
+        c = sqlite3.connect(out)
+        rows = c.execute("SELECT ts, strategy, slug, outcome, side, shares, avg_price, fee FROM fills "
+                         "ORDER BY ts, strategy").fetchall()
+        sett = c.execute("SELECT strategy, slug, pnl FROM settlements ORDER BY strategy, slug").fetchall()
+        lb = c.execute("SELECT COUNT(*) FROM sqlite_master WHERE name='latency_books'").fetchone()[0]
+        c.close()
+        return rows, sett, lb
+
+    def test_option_off_is_identical_and_leaves_no_trace(self):
+        default = self.run_("default")
+        same = self.run_("same", latency_book="same")
+        self.assertGreater(len(default[0]), 0)
+        self.assertEqual(default[:2], same[:2])
+        self.assertEqual(default[2], 0)                                # no latency_books table when the option is off
+
+    def test_ws_mode_with_no_ws_data_falls_back_to_exactly_the_old_result(self):
+        same = self.run_("same2", latency_book="same")
+        ws = self.run_("out_ws_fallback", latency_book="ws", ws_book_path=self.empty_ws)
+        self.assertEqual(same[:2], ws[:2])
+        c = sqlite3.connect(os.path.join(self.dir, "out_ws_fallback.db"))
+        n = c.execute("SELECT COUNT(*), SUM(source='no-latency-book') FROM latency_books").fetchone()
+        c.close()
+        self.assertGreater(n[0], 0)
+        self.assertEqual(n[0], n[1])                                   # every fetch fell back
+
+    def test_replay_never_writes_the_ws_database(self):
+        before = digest(self.empty_ws)
+        self.run_("ws_ro", latency_book="ws", ws_book_path=self.empty_ws)
+        self.assertEqual(before, digest(self.empty_ws))

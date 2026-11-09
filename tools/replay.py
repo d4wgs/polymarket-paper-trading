@@ -163,8 +163,14 @@ def main():
     ap.add_argument("--ws-trades", nargs="?", const="data/ws_events.db", default=None, metavar="WS_DB",
                     help="maker fills from recorded websocket trade prints (default rule stays book trade-through)")
     ap.add_argument("--sigma", choices=["recorded", "ewma"], default="recorded")
-    ap.add_argument("--latency-book", choices=["next", "same"], default="same",
-                    help="book used for the order latency fill: the next recorded one, or the decision book")
+    ap.add_argument("--latency-book", choices=["next", "same", "ws"], default="same",
+                    help="book used for the order latency fill: the decision book (default), the next recorded "
+                         "one, or 'ws': rebuilt from the websocket recording at decision time + latency "
+                         "(needs --ws-db; only valid for periods the recorder covered; falls back to the decision "
+                         "book where it has a gap)")
+    ap.add_argument("--ws-db", default=None, help="websocket recording for --latency-book ws (default data/ws_events.db)")
+    ap.add_argument("--latency-ms", type=float, default=None,
+                    help="replay-only override of the order latency (default: fills.latency_ms in config.yaml)")
     ap.add_argument("--cold-start", action="store_true",
                     help="start every strategy fresh at its bankroll (default: restore the live state as of the start)")
     ap.add_argument("--model-check", action="store_true",
@@ -191,9 +197,24 @@ def main():
 
     def prog(n, t):
         print(f"  ... {n} ticks, at {dt.datetime.fromtimestamp(t, dt.timezone.utc):%m-%d %H:%M}", flush=True)
+    ws_book = None
+    if args.latency_book == "ws":
+        ws_book = args.ws_db or args.ws_trades or "data/ws_events.db"
+        print(f"latency book: websocket recording {ws_book} (latency "
+              f"{args.latency_ms if args.latency_ms is not None else config.LATENCY_SECONDS * 1000:g} ms)")
     engine = run_replay(config, args.src, args.out, t0, t1, only=names, ws_path=args.ws_trades,
                         sigma_mode=args.sigma, latency_book=args.latency_book, progress=prog,
-                        keep_snapshots=args.model_check, warm_start=not args.cold_start)
+                        keep_snapshots=args.model_check, warm_start=not args.cold_start,
+                        ws_book_path=ws_book, latency_ms=args.latency_ms,
+                        ws_book_max_age=float((getattr(config, "RAW", {}).get("replay") or {}).get("ws_book_max_age_s", 60)))
+    if args.latency_book == "ws":
+        used = sum(1 for r in engine.latency_log if r[2] == "ws")
+        why = {}
+        for r in engine.latency_log:
+            if r[2] != "ws":
+                why[r[3]] = why.get(r[3], 0) + 1
+        print(f"latency fetches: {used} used a websocket book, {len(engine.latency_log) - used} fell back to the "
+              f"decision-time book (no-latency-book) {why or ''}")
     print(f"replayed {engine.ticks_replayed} ticks -> {args.out}")
     open_left = [(n, len(b.positions)) for n, b in engine.brokers.items() if b.positions]
     if open_left:
