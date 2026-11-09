@@ -33,6 +33,7 @@ from typing import Optional
 
 from core.polymarket_us import _amount, _iso_ts
 from core.recorder import disk_report
+from core.ws_trim import Policy, Trimmer
 
 log = logging.getLogger("ws_store")
 
@@ -88,11 +89,13 @@ class WsStore:
         self.clock = clock
         self.levels = int(cfg.get("book_levels", 10))
         self.min_interval = float(cfg.get("book_min_interval_ms", 500)) / 1000.0
-        self.book_keep_days = cfg.get("book_keep_days", 2)
-        self.trades_keep_days = cfg.get("trades_keep_days", 14)
+        self.policy = Policy.from_cfg(cfg)
+        self.book_keep_days = self.policy.keep_days["ws_book"]
+        self.trades_keep_days = self.policy.keep_days["ws_trades"]
         self.max_db_mb = cfg.get("max_db_mb", 3000)
         os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
         self.db = sqlite3.connect(path, check_same_thread=False)
+        self.db.execute("PRAGMA auto_vacuum=INCREMENTAL")      # only takes effect on a brand-new file (see ws_trim)
         self.db.execute("PRAGMA journal_mode=WAL")
         self.db.execute("PRAGMA synchronous=NORMAL")
         self.db.executescript(SCHEMA)
@@ -106,6 +109,11 @@ class WsStore:
         self._last_commit = clock()
         self._last_prune = 0.0
         self._last_gc = 0.0
+        self.trimmer = Trimmer(self.db, path, self.policy)
+        log.info("Retention: ws_book %s d, ws_trades %s d, min keep %.0f h, cap %s MB (trim to %.0f%%), auto_vacuum=%s",
+                 self.book_keep_days, self.trades_keep_days, self.policy.min_keep_s / 3600, self.max_db_mb,
+                 self.policy.target_frac * 100, {0: "off", 1: "full", 2: "incremental"}.get(
+                     self.db.execute("PRAGMA auto_vacuum").fetchone()[0]))
         self.stored = {"book": 0, "trade": 0, "dup_trade": 0, "skipped_book": 0}
 
     # ---------------------------------------------------------------------------- sink API
@@ -201,42 +209,26 @@ class WsStore:
         if self._uncommitted and (self._uncommitted >= 500 or now - self._last_commit >= 1.0):
             self.db.commit()
             self._uncommitted, self._last_commit = 0, now
-        if now - self._last_prune >= 600:
+        # a pass that ran out of time budget is continued soon (30 s of data time), otherwise every 10 minutes
+        if now - self._last_prune >= (30 if self.trimmer.more else 600):
             self._last_prune = now
             try:
                 self.prune(now)
             except Exception:
                 log.exception("Retention pass failed; will retry")
 
-    def prune(self, now: float, batch: int = 50_000) -> dict:
-        """Retention + size guard. Deletes in batches so a long delete never blocks recording for long."""
-        deleted = {"book": 0, "trades": 0}
-        plan = []
-        if self.book_keep_days:
-            plan.append(("ws_book", "book", now - self.book_keep_days * 86400))
-        if self.trades_keep_days:
-            plan.append(("ws_trades", "trades", now - self.trades_keep_days * 86400))
-        for table, name, cutoff in plan:
-            n = self.db.execute(f"DELETE FROM {table} WHERE rowid IN "
-                                f"(SELECT rowid FROM {table} WHERE recv_ts < ? LIMIT ?)", (cutoff, batch)).rowcount
-            deleted[name] += n
-        # hard size cap: the file never shrinks by itself, so judge by live pages (file - free pages)
-        if self.max_db_mb:
-            page = self.db.execute("PRAGMA page_size").fetchone()[0]
-            total = self.db.execute("PRAGMA page_count").fetchone()[0]
-            free = self.db.execute("PRAGMA freelist_count").fetchone()[0]
-            live_mb = (total - free) * page / 1e6
-            if live_mb > self.max_db_mb:
-                cut = self.db.execute("SELECT recv_ts FROM ws_book ORDER BY recv_ts LIMIT 1 OFFSET "
-                                      "(SELECT COUNT(*) / 2 FROM ws_book)").fetchone()
-                if cut:
-                    n = self.db.execute("DELETE FROM ws_book WHERE rowid IN (SELECT rowid FROM ws_book "
-                                        "WHERE recv_ts < ? LIMIT ?)", (cut[0], batch)).rowcount
-                    deleted["book"] += n
-                    log.warning("ws_events.db live data %.0f MB > max_db_mb %s: trimmed %d old book rows",
-                                live_mb, self.max_db_mb, n)
-        self.db.commit()
+    def prune(self, now: float, batch: Optional[int] = None) -> dict:
+        """Retention + size cap over ALL recorded tables (see core/ws_trim.py). Time-bounded; returns the
+        deleted row counts as {"book": n, "trades": n}."""
+        if batch:
+            self.policy.batch = batch
+        self._flush_pending()
+        res = self.trimmer.run(now)
+        deleted = {"book": res["deleted"]["ws_book"], "trades": res["deleted"]["ws_trades"]}
         if any(deleted.values()):
-            log.info("Retention deleted %s", deleted)
+            log.info("Retention/cap deleted %s rows (before %s, after %s)%s", deleted, res["before"], res["after"],
+                     " - more to do, continuing" if self.trimmer.more else "")
+        for w in res["warnings"]:
+            log.warning("Size cap: %s", w)
         log.info("Disk: %s", disk_report(self.path))
         return deleted
