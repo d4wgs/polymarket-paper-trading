@@ -105,8 +105,32 @@ RestartSec=10
 WantedBy=multi-user.target
 EOF
 
+# The websocket recorder is a SEPARATE service: a crash or restart of it never touches the trading bot.
+# It needs the API key in $APP_DIR/.env (PM_KEY_ID=..., PM_SECRET_KEY=...; chmod 600; never committed).
+sudo tee /etc/systemd/system/polymarket-recorder.service >/dev/null <<EOF
+[Unit]
+Description=Polymarket US websocket recorder (separate from the trading bot)
+Wants=network-online.target time-sync.target
+After=network-online.target time-sync.target
+
+[Service]
+User=$RUN_USER
+WorkingDirectory=$APP_DIR
+EnvironmentFile=-$APP_DIR/.env
+ExecStart=$APP_DIR/.venv/bin/python tools/ws_recorder.py
+Restart=always
+RestartSec=15
+Nice=5
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
 sudo systemctl daemon-reload
 sudo systemctl enable --now polymarket-bot.service polymarket-dashboard.service
+if [ -f "$APP_DIR/.env" ]; then sudo systemctl enable --now polymarket-recorder.service; else echo "NOTE: no $APP_DIR/.env yet, so the recorder was not started. Create it (see .env.example), then: sudo systemctl enable --now polymarket-recorder"; fi
 
 echo
 echo "==> Clock check (the bot times every round off this clock; 'System clock synchronized: yes' is required)"

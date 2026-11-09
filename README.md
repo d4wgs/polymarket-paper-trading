@@ -113,7 +113,30 @@ Restarting `run.py` resumes cash and open positions from the database. **Raspber
 - **Retention.** The raw order-book log (`books`, ~50 MB/day) is trimmed to `engine.books_keep_days` (default 3) every 10 minutes; freed pages are reused, so the DB file stops growing once the window is full. Compact tables (`snapshots`, `fills`, `settlements`, `equity`, `market_stats`) are kept.
 - **Backups.** `tools/backup_db.sh` (Pi, cron 03:30) makes a consistent gzip copy of the DB in `data/backups/` (3 kept). `tools/pull_backup.ps1` (Windows, scheduled task `PolymarketPiBackup`, register with `-Register`) triggers it and copies the result to `~/polymarket-backups` (14 kept). Older order books therefore live on in those off-Pi copies.
 - **Volume stats.** Each REST book poll carries the market's `stats` (shares/notional traded, open interest, high/low/last). They're stored in `market_stats` whenever they change (30 s heartbeat).
-- **API keys never go in git.** Put `POLYMARKET_US_API_KEY` (and `..._SECRET`) in the environment or a gitignored `.env` (see `.env.example`); read them via `core/credentials.py`. Paper trading needs no key today.
+- **API keys never go in git.** Put `PM_KEY_ID` and `PM_SECRET_KEY` (from polymarket.us/developer) in the environment or a gitignored `.env` (copy `.env.example`; `chmod 600` on the Pi); `core/credentials.py` reads them and nothing ever logs them. Only the websocket recorder needs a key; paper trading itself uses public data.
+
+## Websocket recorder (separate process)
+
+`python tools/ws_recorder.py` (systemd unit `deploy/raspberry-pi/polymarket-recorder.service`) connects to `wss://api.polymarket.us/v1/ws/markets` and records, for the current **and next** round of every configured market, `SUBSCRIPTION_TYPE_MARKET_DATA` (book + stats) and `SUBSCRIPTION_TYPE_TRADE`. It is its own process and writes its own file, `data/ws_events.db`, so it can never stop trading or lock/bloat `paper_us.db`. Handshake signing is the official `polymarket-us` SDK's (`X-PM-Access-Key` / `-Timestamp` / `-Signature`, Ed25519 over `timestamp + "GET" + "/v1/ws/markets"`); the system clock must be within 30 s of real time.
+
+What a 30-minute probe showed (`python tools/ws_recorder.py --probe 1800` writes the raw messages to `data/ws_probe.jsonl`): book messages are **full snapshots**, not deltas (about 100 levels a side, ~8 KB, 5-10 per second per market, nearly every one different); trade messages are one print each with a unique `id`; the exchange sends no heartbeats. So the recorder keeps the top 10 levels plus stats, skips unchanged content and limits rows to one per market per 500 ms, and keeps **every** trade print.
+
+Tables in `ws_events.db`: `ws_book` (recv_ts, exch_ts, slug, state, best bid/ask, top levels JSON, last price/qty, shares & notional traded, open interest, hi/lo), `ws_trades` (recv_ts, trade_ts, slug, trade_id unique, price, qty, maker/taker side, intent, outcome side, action, state), `ws_gaps` (a row on every connect/disconnect/stop: data between a `disconnect` and the next `connect` may be missing), `ws_meta`. Config: the `recorder:` block in `config.yaml` (retention days, `max_db_mb` size cap, disk usage is logged every `disk_log_seconds`). Reconnects use exponential backoff (HTTP 429 and rejected handshakes back off harder), subscriptions are re-sent on every connect, and a watchdog reconnects after `stale_seconds` of silence.
+
+## Replay (`tools/replay.py`)
+
+Feeds recorded `books` + `snapshots` (spot, sigma, index, price-to-beat) + `windows` + official `resolutions` through the **real** engine, strategies and broker, with an injected clock (the engine already took `clock=`/`sleep=`; live behaviour is unchanged and a test pins that). The source DB is opened read-only and results go to their own file (`data/replay.db`).
+
+```
+python tools/replay.py --src data/paper_us.db --days 1                    # last day of the recording
+python tools/replay.py --src X.db --from 2026-11-08 --to 2026-11-09       # UTC date range
+python tools/replay.py --src X.db --days 3 --holdout 1                    # in-sample vs the newest day
+python tools/replay.py --src X.db --strategy s3_sniper_v2 --self-check    # compare with the live bot's own fills
+python tools/replay.py --src X.db --days 1 --ws-trades data/ws_events.db  # maker fills from ws trade prints
+```
+
+The report (trades, P&L, win rate, average entry, fees, t-stat) comes from `core/metrics.py`, the same code as the dashboard. Maker fills keep the conservative book trade-through rule unless `--ws-trades` is given (then a resting bid fills only on prints strictly through its price).
+`--self-check` replays a period the live bot already traded and diffs fills and P&L against the live `fills`; `--model-check` compares the replayed fair value with the recorded one tick by tick. Known approximations: a recording has a book every ~2 s, so the order-latency re-fetch uses the decision book (`--latency-book next` uses the next recorded one, which matched worse); spot history is the recorded per-tick spot; thresholds that sit exactly on a decision boundary can flip. Back-up databases (`~/polymarket-backups`) can be replayed too, and the order books older than `books_keep_days` only exist in those.
 
 ## Honest limitations
 

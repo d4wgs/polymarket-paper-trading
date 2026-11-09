@@ -1,0 +1,21 @@
+[Unit]
+Description=Polymarket US websocket recorder (separate from the trading bot)
+Wants=network-online.target time-sync.target
+After=network-online.target time-sync.target
+
+[Service]
+User=sujayketh
+WorkingDirectory=/home/sujayketh/polymarket-paper
+# API key: PM_KEY_ID / PM_SECRET_KEY live in this root-readable-only file (never in git). The leading "-"
+# means the service still starts (and logs a clear error) if the file is missing.
+EnvironmentFile=-/home/sujayketh/polymarket-paper/.env
+ExecStart=/home/sujayketh/polymarket-paper/.venv/bin/python tools/ws_recorder.py
+Restart=always
+RestartSec=15
+# A recorder crash/restart never touches polymarket-bot; it only writes data/ws_events.db
+Nice=5
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
