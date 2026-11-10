@@ -168,6 +168,8 @@ def backfill(read_con, write_con, poll_seconds: float, cfg: Optional[dict], now:
         cur = read_con.execute(f"SELECT {','.join(COLS)} FROM round_validity")
         src_rows = {r[0]: dict(zip(COLS, r)) for r in cur}
     n = {"checked": 0, "added": 0, "invalid": 0, "reasons": {}}
+    pending = []          # verdicts are computed first (reads only) and written in one short burst at the end, so
+                          # a backfill never holds a write lock while a running bot wants to commit its tick
     for slug, asset, ws, we in finished_rounds(read_con, since, until):
         if slug in done:
             continue
@@ -177,9 +179,11 @@ def backfill(read_con, write_con, poll_seconds: float, cfg: Optional[dict], now:
             n["invalid"] += 1
             for part in (row["reason"] or "").split(","):
                 n["reasons"][part] = n["reasons"].get(part, 0) + 1
-        if not dry_run and record(write_con, row, now, row.get("source") if slug in src_rows else source):
-            n["added"] += 1
+        pending.append((row, row.get("source") if slug in src_rows else source))
     if not dry_run:
+        for row, src_name in pending:
+            if record(write_con, row, now, src_name):
+                n["added"] += 1
         write_con.commit()
     return n
 
