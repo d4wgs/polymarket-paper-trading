@@ -38,7 +38,7 @@ Live result of the originals after ~1 day: `s4_momentum_v1` +$189 (316 trades, t
 | `s3_sniper_v3c` | `s3_sniper_v3c_floor70_cap97` | 70¢ floor and a 97¢ cap (above that a win pays < 3¢) |
 | `s3_sniper_v3d` | `s3_sniper_v3d_model_floor50` | "Winning" comes from the fair-value model (live spot + settlement averaging) instead of the lagged index; 50¢ floor |
 | `s4_momentum_min80` | `s4_momentum_min80_v1` | S4 with the crowd price ≥ 80¢ |
-| `s4_momentum_edge` | `s4_momentum_edge0_v1` | S4 that also needs non-negative model edge |
+| `s4_momentum_edge_t4` | `s4_momentum_edge0_v1_t4` | S4 that also needs non-negative model edge (Student-t model; the normal-model `s4_momentum_edge0_v1` is retired) |
 | `s4_momentum_15m` | `s4_momentum_15m_v1` | S4 on 15-minute rounds only |
 | `s4b_minute_buckets_v2` | `s4b_minute_buckets_v2` | Minute buckets + the side's mid must be ≥ 50¢ |
 
@@ -47,6 +47,47 @@ A strategy block may set `class: <registry key>` so several variants share one i
 **5m vs 15m.** The leaderboard, KPIs and charts combine both round lengths. The dashboard's *Strategy lab* has a section **5-minute vs 15-minute rounds** with the scorecard (P&L, win %, breakeven %, avg entry, t-stat, fees) split per strategy and round length, with a Both / 5m / 15m switch.
 
 Old strategies (previous winner, last 60s, underdog, scalp) are in [`archive/`](archive/); their history stays in the database and shows on the dashboard as "retired".
+
+## The test freeze (2026-11-09): what makes the results trustworthy
+
+Before the official live test, a set of one-time changes went in. **From the freeze date in [`FREEZE.md`](FREEZE.md),
+any change to a variant (parameters, code, model, even a bug fix) means a new name and a restarted evidence count.**
+The pass criteria for every variant are written down in advance in [`docs/PASS_CRITERIA.md`](docs/PASS_CRITERIA.md).
+
+- **Model: Student-t, df 4** (`model.distribution: student_t`). Recorded 3-sigma moves happened about 2% of the time
+  against 0.27% under the normal. df 4 was picked on the same data the strategies are judged on, so it is a fixed
+  design choice: don't re-tune it. Strategies whose decisions use the model were renamed with `_t4` and the
+  normal-model versions retired (disabled, history kept): `s4_momentum_edge0_v1_t4`, `s6_shock_reversion_v1_t4`,
+  `s7_nested_pair_ev_v1_t4`. `s3_sniper_v3d_model_floor50` kept its name: it only asks whether P(Up) ≥ 0.5, which
+  is the same under either distribution (replayed: identical fills).
+- **Version stamps** (`core/version.py`). Every strategy registration, fill and settlement records `code_version`
+  (git commit, `-dirty` if there were uncommitted changes), `params_hash` (the resolved parameters), `source_hash`
+  (the strategy's own source file) and `config_version`. The Pi has no git: run `python deploy/stamp.py` on the PC
+  before deploying and copy the `VERSION` file it writes along with the code. The "different settings" warning now
+  names the old and new hashes and the parameters that changed; every stamp a name has run under is kept in
+  `strategy_versions`. Rows from before stamping are NULL ("unversioned").
+- **Order log** (`core/orderlog.py`, table `orders`). For every order: bid / ask and displayed depth to the limit
+  when the strategy decided, intended size, the book the broker actually filled against, fill ratio, slippage and a
+  reason code when it did not fill (`price_moved`, `no_liquidity`, `risk_limit`, `latency_book_empty`,
+  `quote_not_traded_through`, ...). Fills link to their order. Logging only: fills are unchanged.
+  `python tools/fill_report.py` prints fill rate, slippage and depth-vs-size per strategy.
+- **Round validity** (`core/validity.py`, table `round_validity`). A round counts in the statistics only if it was
+  recorded well enough: no gap over 10 s, at least 90% of the expected ticks, at most 10% of ticks without spot or
+  fair value, no bot restart and no critical clock drift during it. Data coverage only, never P&L, the same for
+  every strategy. The dashboard, `tools/replay.py`, `tools/validate.py` and `tools/fill_report.py` leave invalid
+  rounds out by default and say how many (`--include-invalid` puts them back; the raw data is never deleted;
+  account values always include every trade). `python tools/round_validity.py --list`; `--backfill` adds verdicts
+  for rounds recorded before this existed.
+- **No-signal controls** (`strategies/controls.py`, names `ctl_*`). Same entry window, price band and stake as the
+  family with the signal removed; own stamp and a $25,000 bankroll (same $25 stake: a control is expected to
+  lose steadily and must not reach the $200 stop). `tools/validate.py` prints *strategy minus its control*
+  per round on the rounds both traded, with a bootstrap CI over rounds. Pairing: `controls:` in `config.yaml`.
+- **Health** (`core/health.py`). Every minute the Pi's clock is compared with the exchange's timestamp on the book
+  polls (and NTP sync is checked); warnings and critical alerts go to the log and the `events` table, a critical
+  one invalidates the rounds it overlaps, and trading is never halted. Bot starts and a heartbeat are recorded in
+  `bot_runs` (downtime is visible); the recorder keeps a heartbeat in its own database. `python tools/health.py`.
+- **Pessimistic replay.** `python tools/replay.py --profile pessimistic` (or `tools/validate.py --profile
+  pessimistic`): +1c extra slippage and 1000 ms latency against a later book. A candidate must still pass under it.
 
 ## Turning strategies on/off and changing parameters
 
@@ -100,7 +141,7 @@ Trades are exported daily to `data/exports/trades_YYYY-MM-DD.csv` (ET day). On d
 python -m venv .venv
 .\.venv\Scripts\Activate.ps1
 pip install -r requirements.txt
-python -m unittest discover -s tests -v      # 157 tests
+python -m unittest discover -s tests -v      # 253 tests
 python tools/simulate.py --hours 24          # offline smoke test -> data/sim_us.db
 python run.py                                # the bot (Ctrl+C to stop)
 streamlit run dashboard.py                   # http://localhost:8501
