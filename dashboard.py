@@ -185,6 +185,8 @@ with st.sidebar.container(border=True):
         st.caption("Showing the last hour (live charts) and all history (analysis charts).")
 
 d0 = load_data(db, _db_version(db), SINCE)
+if metrics.validity_note(d0):                       # rounds left out of the statistics for data gaps, and why
+    st.sidebar.caption(metrics.validity_note(d0))
 EXCHANGE = d0.get("exchange", "polymarket_intl")
 FEE_LINES = US_FEE_LINES if EXCHANGE == "polymarket_us" else INTL_FEE_LINES
 if not len(d0["strategies"]):

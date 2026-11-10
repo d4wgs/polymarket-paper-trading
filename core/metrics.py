@@ -80,10 +80,47 @@ def _tables(con) -> set[str]:
     return {r[0] for r in con.execute("SELECT name FROM sqlite_master WHERE type='table'")}
 
 
+def apply_validity(out: dict, invalid: dict, include_invalid: bool, tables=("fills", "settlements")) -> dict:
+    """
+    Leave rounds marked invalid (core/validity.py: data gaps, restarts, clock drift) out of the statistics.
+    `invalid` = {slug: reason}. The untouched tables stay available as <name>_all (account values are rebuilt
+    from those: the money was really spent), and out["validity"] says what was left out and why.
+    include_invalid=True changes nothing in the tables, so every number is exactly what it was before this existed.
+    """
+    from core.validity import reason_counts
+    info = {"invalid_rounds": len(invalid), "excluded": bool(invalid) and not include_invalid,
+            "reasons": reason_counts(invalid.values())}
+    for t in tables:
+        df = out[t]
+        out[t + "_all"] = df
+        hit = df["slug"].isin(invalid) if len(df) and invalid else None
+        info["invalid_" + t] = int(hit.sum()) if hit is not None else 0
+        if hit is not None and not include_invalid:
+            out[t] = df[~hit].reset_index(drop=True)
+    out["validity"] = info
+    return out
+
+
+def validity_note(d: dict) -> str:
+    """One line for reports: how many rounds were excluded from the statistics, and why ('' if none are marked)."""
+    v = d.get("validity") or {}
+    if not v.get("invalid_rounds"):
+        return ""
+    why = ", ".join(f"{k} {n}" for k, n in v["reasons"].items())
+    if v["excluded"]:
+        return (f"Statistics EXCLUDE {v['invalid_rounds']} round(s) marked invalid for data coverage ({why}): "
+                f"{v.get('invalid_settlements', 0)} settled trades and {v.get('invalid_fills', 0)} fills left out. "
+                f"Account values still include them.")
+    return (f"Statistics INCLUDE {v['invalid_rounds']} round(s) marked invalid for data coverage ({why}): "
+            f"{v.get('invalid_settlements', 0)} settled trades, {v.get('invalid_fills', 0)} fills.")
+
+
 def load(db_path: str, equity_window: float | None = None, max_dd: dict | None = None,
-         since: float | None = None) -> dict[str, pd.DataFrame]:
+         since: float | None = None, include_invalid: bool = False) -> dict[str, pd.DataFrame]:
     """
     Read the database into DataFrames.
+    include_invalid: False (default) leaves rounds marked invalid in `round_validity` out of fills / settlements
+                   (out["validity"] counts them; fills_all / settlements_all keep everything). True = everything.
     equity_window: only load the last N seconds of the equity curve (plus each strategy's latest
                    row), so a dashboard refreshing every few seconds stays fast as history grows.
                    Pass `max_dd` (from max_drawdowns) so the drawdown still covers all history.
@@ -106,6 +143,8 @@ def load(db_path: str, equity_window: float | None = None, max_dd: dict | None =
     out["status"] = (pd.read_sql("SELECT * FROM strategy_status", con) if "strategy_status" in have
                      else pd.DataFrame(columns=["name", "stopped_at", "equity", "reason"]))
     meta = dict(con.execute("SELECT key, value FROM meta").fetchall()) if "meta" in have else {}
+    from core.validity import invalid_rounds
+    invalid = invalid_rounds(con) if "round_validity" in have else {}
     con.close()
     out["meta"] = meta
     out["exchange"] = meta.get("exchange") or ("polymarket_us" if "_us" in db_path else "polymarket_intl")
@@ -113,7 +152,7 @@ def load(db_path: str, equity_window: float | None = None, max_dd: dict | None =
     for t in ("fills", "settlements", "equity", "snapshots"):
         # always add the column, even to an empty table (a new database has no settlements yet)
         out[t]["time"] = _to_time(out[t]["ts"])
-    return out
+    return apply_validity(out, invalid, include_invalid)
 
 
 def closed_rounds(fills: pd.DataFrame, sett: pd.DataFrame) -> pd.DataFrame:
@@ -209,7 +248,8 @@ def leaderboard(d: dict[str, pd.DataFrame]) -> pd.DataFrame:
         else:
             if marks is None:
                 marks = open_positions_marked(d)
-            equity_now = ledger_value(name, bankroll, fills, sett, marks)
+            # the account's real value: rebuilt from EVERY fill, also those of rounds left out of the statistics
+            equity_now = ledger_value(name, bankroll, d.get("fills_all", fills), d.get("settlements_all", sett), marks)
         if d.get("max_dd") is not None:
             max_dd = d["max_dd"].get(name, 0.0) or 0.0
         elif len(e):
@@ -364,7 +404,7 @@ def open_positions_marked(d) -> pd.DataFrame:
 
 
 def open_positions(d) -> pd.DataFrame:
-    f, s = d["fills"], d["settlements"]
+    f, s = d.get("fills_all", d["fills"]), d.get("settlements_all", d["settlements"])   # open bets: all of them
     if not len(f):
         return f
     settled = set(zip(s["strategy"], s["slug"])) if len(s) else set()

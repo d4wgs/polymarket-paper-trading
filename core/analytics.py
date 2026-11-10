@@ -36,7 +36,8 @@ def _ro(db_path):
     return sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
 
 
-def load_lab(db_path: str) -> dict[str, pd.DataFrame]:
+def load_lab(db_path: str, include_invalid: bool = False) -> dict[str, pd.DataFrame]:
+    """include_invalid=False (default): rounds marked invalid (core/validity.py) are left out, as in metrics.load."""
     con = _ro(db_path)
     try:
         have = {r[0] for r in con.execute("SELECT name FROM sqlite_master WHERE type='table'")}
@@ -49,8 +50,11 @@ def load_lab(db_path: str) -> dict[str, pd.DataFrame]:
                                   "GROUP BY strategy, kind", con)
             if "events" in have else pd.DataFrame(columns=["strategy", "kind", "n", "last_ts"]),
         }
+        from core.validity import invalid_rounds
+        invalid = invalid_rounds(con) if "round_validity" in have else {}
     finally:
         con.close()
+    metrics.apply_validity(out, invalid, include_invalid)
     f = out["fills"]
     for c in ("liquidity", "fair_value", "edge", "seconds_left", "fv_after_5s", "rebate"):
         if c not in f:
