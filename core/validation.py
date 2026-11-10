@@ -103,6 +103,61 @@ def bootstrap_expectancy(pnl: np.ndarray, n_buys: np.ndarray, n_boot: int = 2000
     return float(np.nanquantile(out, a)), float(np.nanquantile(out, 1 - a))
 
 
+def bootstrap_mean(x: np.ndarray, n_boot: int = 2000, seed: int = 12345, ci: float = 0.95) -> tuple[float, float]:
+    """Bootstrap CI of a mean over ROUNDS (resampling rounds with replacement; fixed seed => reproducible)."""
+    x = np.asarray(x, float)
+    m = len(x)
+    if m < 2:
+        return float("nan"), float("nan")
+    rng = np.random.default_rng(seed)
+    out = np.empty(n_boot)
+    step = max(1, 4_000_000 // m)
+    for i in range(0, n_boot, step):
+        k = min(step, n_boot - i)
+        out[i:i + k] = x[rng.integers(0, m, size=(k, m))].mean(axis=1)
+    a = (1 - ci) / 2
+    return float(np.quantile(out, a)), float(np.quantile(out, 1 - a))
+
+
+def paired_vs_control(rounds: pd.DataFrame, strategy: str, control: str, n_boot: int = 2000,
+                      seed: int = 12345) -> dict:
+    """
+    Strategy minus its no-signal control, round by round, on IDENTICAL rounds only: the rounds in which BOTH have
+    a final P&L (a round only one of them traded says nothing about the signal and is left out, but counted).
+    diff = strategy P&L - control P&L per round; the CI resamples rounds.
+    """
+    s = rounds[rounds["strategy"] == strategy].set_index("slug")["pnl"]
+    c = rounds[rounds["strategy"] == control].set_index("slug")["pnl"]
+    both = s.index.intersection(c.index)
+    out = {"strategy": strategy, "control": control, "rounds": int(len(both)),
+           "strategy_only": int(len(s) - len(both)), "control_only": int(len(c) - len(both))}
+    if not len(both):
+        return out
+    sp, cp = s.loc[both].to_numpy(float), c.loc[both].to_numpy(float)
+    d = sp - cp
+    lo, hi = bootstrap_mean(d, n_boot, seed)
+    out.update(strategy_pnl=float(sp.sum()), control_pnl=float(cp.sum()), diff_total=float(d.sum()),
+               diff_per_round=float(d.mean()), ci_lo=lo, ci_hi=hi, t_stat=metrics.t_stat_of(d),
+               strategy_win_rate=float((sp > 0).mean()), control_win_rate=float((cp > 0).mean()))
+    return out
+
+
+def render_paired(rows: list[dict]) -> str:
+    head = (f"{'strategy':<30} {'control':<16} {'rounds':>6} {'strat $':>9} {'ctl $':>9} {'diff $':>9} "
+            f"{'diff/round':>10} {'95% CI (rounds)':<20} {'t':>6} {'only S':>6} {'only C':>6}")
+    lines = [head]
+    for r in rows:
+        if not r["rounds"]:
+            lines.append(f"{r['strategy']:<30} {r['control']:<16} {0:>6}  (no common rounds; strategy-only "
+                         f"{r['strategy_only']}, control-only {r['control_only']})")
+            continue
+        lines.append(f"{r['strategy']:<30} {r['control']:<16} {r['rounds']:>6} {r['strategy_pnl']:>9.2f} "
+                     f"{r['control_pnl']:>9.2f} {r['diff_total']:>9.2f} {r['diff_per_round']:>+10.3f} "
+                     f"[{_f(r['ci_lo'], '+.3f')},{_f(r['ci_hi'], '+.3f')}]".ljust(118)
+                     + f" {_f(r['t_stat'], '.2f'):>6} {r['strategy_only']:>6} {r['control_only']:>6}")
+    return "\n".join(lines)
+
+
 def summarize(r: pd.DataFrame, n_boot: int = 2000, seed: int = 12345) -> dict:
     """Stats for one strategy's rounds (one split)."""
     n = len(r)
@@ -230,11 +285,12 @@ def build_report(fills: pd.DataFrame, sett: pd.DataFrame, *, strategies: Optiona
                  markets: Optional[list[str]] = None, holdout_days: float = 0.0, dev_days: float = 0.0,
                  holdout_frac: float = 0.0, reveal_holdout: bool = False, n_boot: int = 2000, seed: int = 12345,
                  depth_lookup=None, price_floor: float = 0.20, price_share: float = 0.25, depth_ratio: float = 1.0,
-                 depth_share: float = 0.25, ws_latency_book: bool = False) -> dict:
+                 depth_share: float = 0.25, ws_latency_book: bool = False, controls: Optional[dict] = None) -> dict:
     """The holdout is neither computed nor returned unless reveal_holdout=True (so it cannot leak by accident).
     `ws_latency_book`: the run filled against websocket order-latency books (Part 2); then the optimism flag's
     price rule is relaxed note-wise only (it still applies to older periods)."""
     rounds = round_table(fills, sett, markets)
+    all_rounds = rounds                                 # controls stay available even when --strategies filters
     if strategies:
         rounds = rounds[rounds["strategy"].isin(strategies)]
     dev, hold, cut = split_rounds(rounds, holdout_days, dev_days, holdout_frac)
@@ -264,6 +320,24 @@ def build_report(fills: pd.DataFrame, sett: pd.DataFrame, *, strategies: Optiona
         if has_holdout and reveal_holdout:
             out["strategies"][n]["holdout"] = one(hold, n)
     out["holdout_revealed"] = bool(has_holdout and reveal_holdout)
+    # strategy minus its no-signal control, on the rounds both traded (same time split; holdout only if revealed)
+    out["paired"] = {"dev": []}                      # the key for the other split exists only once it is revealed
+    if has_holdout and reveal_holdout:
+        out["paired"]["holdout"] = []
+    if controls:
+        a_dev, a_hold, _ = split_rounds(all_rounds, holdout_days, dev_days, holdout_frac)
+        if has_holdout:                                 # the split must be THE SAME cut as above
+            a_dev = all_rounds[all_rounds["start"] < cut]
+            if dev_days:
+                a_dev = a_dev[a_dev["start"] >= cut - dev_days * 86400.0]
+            a_hold = all_rounds[all_rounds["start"] >= cut]
+        present = set(all_rounds["strategy"].unique())
+        for s_name, c_name in controls.items():
+            if s_name not in names or c_name not in present:
+                continue
+            out["paired"]["dev"].append(paired_vs_control(a_dev, s_name, c_name, n_boot, seed))
+            if has_holdout and reveal_holdout:
+                out["paired"]["holdout"].append(paired_vs_control(a_hold, s_name, c_name, n_boot, seed))
     return out
 
 
