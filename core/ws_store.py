@@ -109,6 +109,7 @@ class WsStore:
         self._last_commit = clock()
         self._last_prune = 0.0
         self._last_gc = 0.0
+        self._last_seen = 0.0                         # heartbeat (ws_meta 'last_seen'): recorder uptime for tools/health.py
         self.trimmer = Trimmer(self.db, path, self.policy)
         log.info("Retention: ws_book %s d, ws_trades %s d, min keep %.0f h, cap %s MB (trim to %.0f%%), auto_vacuum=%s",
                  self.book_keep_days, self.trades_keep_days, self.policy.min_keep_s / 3600, self.max_db_mb,
@@ -200,6 +201,10 @@ class WsStore:
     # ---------------------------------------------------------------------------- upkeep
     def _housekeeping(self, now: float):
         self._flush_pending(now)
+        if now - self._last_seen >= 60:              # one small row a minute: when the recorder last wrote data
+            self._last_seen = now
+            self.db.execute("INSERT OR REPLACE INTO ws_meta VALUES ('last_seen', ?)", (f"{now:.3f}",))
+            self._uncommitted += 1
         if now - self._last_gc >= 600:               # forget slugs that have been quiet for an hour (rounds are over)
             self._last_gc = now
             for slug in [k for k, t in self._last_write.items() if now - t > 3600]:
