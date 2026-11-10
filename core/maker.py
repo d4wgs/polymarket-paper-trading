@@ -40,6 +40,10 @@ class Quote:
     filled: float = 0.0
     reason: str = ""
     meta: dict = field(default_factory=dict)
+    # order log only (core/orderlog.py); never read by the fill rules
+    order_id: Optional[int] = None
+    decision: Optional[tuple] = None    # (best bid, best ask, depth, depth $) when the bid was placed
+    got: float = 0.0                    # shares the broker actually booked (can be capped by cash)
 
     @property
     def remaining(self) -> float:
@@ -55,12 +59,17 @@ class MakerBook:
         self.latency = latency
         self.conservative_queue = conservative_queue
         self.quotes: dict[tuple[str, str, str], Quote] = {}     # (strategy, slug, outcome) -> Quote
+        self.on_close = None        # optional callback(quote, why) when a bid is cancelled / replaced / expired
+
+    def _closed(self, q: Quote, why: str):
+        if self.on_close is not None:
+            self.on_close(q, why)
 
     # ------------------------------------------------------------- placing / cancelling
     def place(self, strategy: str, slug: str, asset: str, outcome: str, price: float, shares: float,
               now: float, book: Book, reason: str = "", meta: Optional[dict] = None) -> Optional[Quote]:
         """Rest a bid (replaces this strategy's bid on that outcome). Returns None if it would cross."""
-        self.cancel(strategy, slug, outcome)
+        self.cancel(strategy, slug, outcome, why="replaced")
         if shares <= 0 or price <= 0:
             return None
         if book.best_ask is not None and price >= book.best_ask - 1e-9:
@@ -71,16 +80,16 @@ class MakerBook:
         self.quotes[(strategy, slug, outcome)] = q
         return q
 
-    def cancel(self, strategy: str, slug: str, outcome: Optional[str] = None) -> int:
+    def cancel(self, strategy: str, slug: str, outcome: Optional[str] = None, why: str = "cancelled") -> int:
         keys = [k for k in self.quotes if k[0] == strategy and k[1] == slug and (outcome is None or k[2] == outcome)]
         for k in keys:
-            del self.quotes[k]
+            self._closed(self.quotes.pop(k), why)
         return len(keys)
 
     def cancel_strategy(self, strategy: str) -> int:
         keys = [k for k in self.quotes if k[0] == strategy]
         for k in keys:
-            del self.quotes[k]
+            self._closed(self.quotes.pop(k), "cancelled")
         return len(keys)
 
     def for_market(self, strategy: str, slug: str) -> dict[str, Quote]:
@@ -89,7 +98,7 @@ class MakerBook:
     def drop_expired(self, now: float, window_end_of) -> None:
         """Remove quotes for rounds that have ended."""
         for k in [k for k, q in self.quotes.items() if window_end_of(q.slug) is not None and now >= window_end_of(q.slug)]:
-            del self.quotes[k]
+            self._closed(self.quotes.pop(k), "round_end")
 
     # ------------------------------------------------------------- fills
     def check(self, strategy: str, slug: str, books: dict[str, Book], now: float) -> list[tuple[Quote, float]]:
