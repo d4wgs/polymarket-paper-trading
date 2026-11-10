@@ -17,3 +17,6 @@ backups/
 *.db-wal
 *.db-shm
 *.sqlite3
+
+# written by deploy/stamp.py at deploy time (a commit can't contain its own hash)
+VERSION
