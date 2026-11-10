@@ -15,6 +15,16 @@ Tables
   meta        - which exchange / fee model this database was recorded with
   market_stats - volume / open interest / last trade of each round (the "stats" block of REST book polls)
   events      - strategy diagnostics that aren't trades (near-misses, failed legs, signals skipped)
+  orders      - one row per order: decision-time bid/ask/depth, intended size, what it got, and why not
+                (core/orderlog.py). Fills point at their order (fills.order_id).
+  round_validity - one verdict per round: was it recorded well enough to count? (core/validity.py)
+  bot_runs    - one row per bot process start, with a last_seen heartbeat (uptime / restarts; core/health.py)
+  health      - periodic clock-drift readings and alerts (core/health.py)
+  strategy_versions - one row each time a strategy name starts with a new stamp (code version, source hash,
+                parameter hash, config version): the history of what actually ran under each name
+
+Version stamps (core/version.py): strategies, fills and settlements carry code_version / params_hash /
+config_version (fills and strategies also source_hash). Rows written before stamping have NULL = "unversioned".
 
 Every fill also records the model's view at entry: fair value of the side traded, edge after fees,
 spot, oracle, basis, sigma, seconds left, maker/taker, and (maker fills) the fair value 5s later.
@@ -26,6 +36,7 @@ import os
 import sqlite3
 from dataclasses import asdict
 
+from core import version
 from core.models import Fill, Settlement, Snapshot
 
 SCHEMA = """
@@ -71,6 +82,30 @@ CREATE TABLE IF NOT EXISTS market_stats (
     open_px REAL, low_px REAL, high_px REAL, last_px REAL, last_qty REAL,
     shares_traded REAL, notional_traded REAL, open_interest REAL, exchange_ts REAL);
 CREATE INDEX IF NOT EXISTS ix_mstats ON market_stats(slug, ts);
+CREATE TABLE IF NOT EXISTS orders (
+    id INTEGER PRIMARY KEY, ts REAL, strategy TEXT, asset TEXT, slug TEXT, kind TEXT, outcome TEXT, side TEXT,
+    intended_usd REAL, intended_shares REAL, limit_px REAL, seconds_left REAL,
+    decision_bid REAL, decision_ask REAL, decision_depth REAL, decision_depth_usd REAL,
+    exec_ts REAL, exec_bid REAL, exec_ask REAL, exec_depth REAL,
+    filled_shares REAL, filled_usd REAL, avg_price REAL, fee REAL, fill_ratio REAL, slippage REAL,
+    status TEXT, reason TEXT, detail TEXT, attempts INTEGER, last_ts REAL, hedge INTEGER,
+    code_version TEXT, params_hash TEXT);
+CREATE INDEX IF NOT EXISTS ix_orders_strat ON orders(strategy, ts);
+CREATE INDEX IF NOT EXISTS ix_orders_slug ON orders(slug);
+CREATE TABLE IF NOT EXISTS round_validity (
+    slug TEXT PRIMARY KEY, asset TEXT, window_start REAL, window_end REAL, valid INTEGER, reason TEXT,
+    ticks INTEGER, expected REAL, coverage REAL, max_gap REAL, no_spot_share REAL, no_fv_share REAL,
+    restarts INTEGER, clock_drift INTEGER, rule TEXT, checked_at REAL, source TEXT);
+CREATE INDEX IF NOT EXISTS ix_rv_end ON round_validity(window_end);
+CREATE TABLE IF NOT EXISTS bot_runs (
+    id INTEGER PRIMARY KEY, process TEXT, started_at REAL, last_seen REAL, code_version TEXT, host TEXT, pid INTEGER);
+CREATE TABLE IF NOT EXISTS health (
+    ts REAL, kind TEXT, level TEXT, value REAL, detail TEXT);
+CREATE INDEX IF NOT EXISTS ix_health ON health(kind, ts);
+CREATE TABLE IF NOT EXISTS strategy_versions (
+    ts REAL, name TEXT, class TEXT, params TEXT, bankroll REAL, assets TEXT,
+    code_version TEXT, params_hash TEXT, source_hash TEXT, config_version TEXT);
+CREATE INDEX IF NOT EXISTS ix_sver ON strategy_versions(name, ts);
 """
 
 # columns added after the first release: (table, column, type) -- added to older databases on open
@@ -83,10 +118,29 @@ MIGRATIONS = [
     ("fills", "spot", "REAL"), ("fills", "oracle", "REAL"), ("fills", "basis", "REAL"),
     ("fills", "sigma", "REAL"), ("fills", "seconds_left", "REAL"), ("fills", "fv_after_5s", "REAL"),
     ("fills", "decision_ts", "REAL"), ("fills", "k", "REAL"), ("fills", "extra", "TEXT"),
+    # version stamps (2026-11-09). Old rows stay NULL = "unversioned"; nothing is backfilled.
+    ("fills", "code_version", "TEXT"), ("fills", "params_hash", "TEXT"), ("fills", "source_hash", "TEXT"),
+    ("fills", "config_version", "TEXT"),
+    ("settlements", "code_version", "TEXT"), ("settlements", "params_hash", "TEXT"),
+    ("settlements", "config_version", "TEXT"),
+    ("strategies", "code_version", "TEXT"), ("strategies", "params_hash", "TEXT"),
+    ("strategies", "source_hash", "TEXT"), ("strategies", "config_version", "TEXT"),
+    # order log (2026-11-09): which order a fill belongs to + the decision-time touch and depth
+    ("fills", "order_id", "INTEGER"), ("fills", "decision_bid", "REAL"), ("fills", "decision_ask", "REAL"),
+    ("fills", "decision_depth", "REAL"), ("fills", "slippage", "REAL"),
 ]
 FILL_META = ("fair_value", "edge", "spot", "oracle", "basis", "sigma", "seconds_left", "decision_ts", "k")
+FILL_STAMP = ("code_version", "params_hash", "source_hash", "config_version")
+FILL_ORDER = ("order_id", "decision_bid", "decision_ask", "decision_depth", "slippage")   # core/orderlog.py
 FILL_COLS = ("ts", "strategy", "asset", "slug", "window_end", "outcome", "side", "shares", "avg_price",
-             "usd", "fee", "reason", "theta", "rebate", "liquidity") + FILL_META + ("extra",)
+             "usd", "fee", "reason", "theta", "rebate", "liquidity") + FILL_META + ("extra",) + FILL_STAMP + FILL_ORDER
+ORDER_COLS = ("ts", "strategy", "asset", "slug", "kind", "outcome", "side", "intended_usd", "intended_shares",
+              "limit_px", "seconds_left", "decision_bid", "decision_ask", "decision_depth", "decision_depth_usd",
+              "exec_ts", "exec_bid", "exec_ask", "exec_depth", "filled_shares", "filled_usd", "avg_price", "fee",
+              "fill_ratio", "slippage", "status", "reason", "detail", "attempts", "last_ts", "hedge",
+              "code_version", "params_hash")
+SETTLE_COLS = ("ts", "strategy", "asset", "slug", "winner", "up_shares", "down_shares", "net_cost", "payout",
+               "pnl", "code_version", "params_hash", "config_version")
 SNAP_COLS = ("ts", "asset", "slug", "seconds_left", "up_bid", "up_ask", "down_bid", "down_ask",
              "up_ask_depth", "down_ask_depth", "price_to_beat", "index_price", "spot", "basis", "sigma",
              "fv_up", "k")
@@ -104,6 +158,8 @@ class Storage:
             if col not in cols:
                 self.db.execute(f"ALTER TABLE {table} ADD COLUMN {col} {typ}")
         self.db.commit()
+        self.run_stamp: dict = {}                 # code_version / config_version of this process (engine sets it)
+        self.stamps: dict[str, dict] = {}         # strategy -> its stamp (set by register_strategy)
 
     # ---------------------------------------------------------------- meta / status
     def set_meta(self, key: str, value: str):
@@ -126,41 +182,116 @@ class Storage:
                         (info.slug, info.asset, info.window_start, info.window_end,
                          getattr(info, "exchange_slug", "") or info.slug, getattr(info, "price_to_beat", None)))
 
-    def register_strategy(self, name, cls, params, bankroll, assets, ts) -> str | None:
-        """Returns a warning string if this name was used before with different settings."""
-        row = self.db.execute("SELECT class, params, bankroll, assets FROM strategies WHERE name=?",
-                              (name,)).fetchone()
+    def stamp_of(self, strategy: str) -> dict:
+        """The stamp written with this strategy's fills / settlements (a strategy that isn't running in this
+        process, e.g. a retired one being settled, still gets the code and config version)."""
+        return {**self.run_stamp, **(self.stamps.get(strategy) or {})}
+
+    def register_strategy(self, name, cls, params, bankroll, assets, ts, stamp: dict | None = None) -> str | None:
+        """
+        Record that `name` is starting with these settings. Returns a warning string if the name was used before
+        with a different params_hash / source_hash (or class, bankroll, markets): the old and new hashes are named,
+        so a blended track record is visible at a glance. Every distinct stamp a name starts with is appended to
+        `strategy_versions` (the existing `strategies` row is never rewritten).
+        """
+        stamp = dict(stamp or {})
+        stamp.setdefault("params_hash", version.params_hash(params))
+        for k in ("code_version", "source_hash", "config_version"):
+            stamp.setdefault(k, self.run_stamp.get(k))
+        self.stamps[name] = stamp
         p = json.dumps(params, sort_keys=True)
         a = json.dumps(sorted(assets) if assets is not None else None)
+        row = self.db.execute("SELECT class, params, bankroll, assets, source_hash FROM strategies WHERE name=?",
+                              (name,)).fetchone()
         if row is None:
-            self.db.execute("INSERT INTO strategies VALUES (?,?,?,?,?,?)", (name, cls, p, bankroll, a, ts))
+            self.db.execute("INSERT INTO strategies (name, class, params, bankroll, assets, created_at, code_version, "
+                            "params_hash, source_hash, config_version) VALUES (?,?,?,?,?,?,?,?,?,?)",
+                            (name, cls, p, bankroll, a, ts, stamp["code_version"], stamp["params_hash"],
+                             stamp["source_hash"], stamp["config_version"]))
+            self._add_version(name, cls, p, bankroll, a, ts, stamp)
             self.db.commit()
             return None
-        old_assets = row["assets"]
+        last = self.db.execute("SELECT * FROM strategy_versions WHERE name=? ORDER BY ts DESC, rowid DESC LIMIT 1",
+                               (name,)).fetchone()
+        if last is not None:
+            old = {"class": last["class"], "params": last["params"], "bankroll": last["bankroll"],
+                   "assets": last["assets"], "params_hash": last["params_hash"], "source_hash": last["source_hash"]}
+        else:                                   # a name from before stamping: derive what can be derived
+            old = {"class": row["class"], "params": row["params"], "bankroll": row["bankroll"],
+                   "assets": row["assets"], "source_hash": row["source_hash"]}
+            try:
+                old["params_hash"] = version.params_hash(json.loads(row["params"] or "{}"))
+            except (TypeError, ValueError):
+                old["params_hash"] = None
         try:   # older rows stored the list unsorted
-            old = json.loads(old_assets) if old_assets else None
-            old_assets = json.dumps(sorted(old) if old is not None else None)
+            oa = json.loads(old["assets"]) if old["assets"] else None
+            old["assets"] = json.dumps(sorted(oa) if oa is not None else None)
         except (TypeError, ValueError):
             pass
-        if row["class"] != cls or row["params"] != p or row["bankroll"] != bankroll or old_assets != a:
-            return (f"Strategy '{name}' already exists in the database with different settings "
-                    f"({row['class']} {row['params']}, bankroll {row['bankroll']}, markets {row['assets']}). "
-                    f"Its history will be mixed. Give it a new name (e.g. '{name}_v2') if you changed "
-                    f"the logic, parameters, bankroll or markets.")
+        diffs = []
+        if old["class"] != cls:
+            diffs.append(f"class {old['class']} -> {cls}")
+        if old["params_hash"] != stamp["params_hash"]:
+            try:
+                o, n = json.loads(old["params"] or "{}"), json.loads(p)
+                keys = sorted(k for k in set(o) | set(n) if version.stable_hash(o.get(k, "<absent>"))
+                              != version.stable_hash(n.get(k, "<absent>")))
+            except (TypeError, ValueError):
+                keys = []
+            diffs.append(f"params_hash {old['params_hash'] or version.UNVERSIONED} -> {stamp['params_hash']}"
+                         + (f" (changed: {', '.join(keys)})" if keys else ""))
+        if old["source_hash"] and stamp["source_hash"] and old["source_hash"] != stamp["source_hash"]:
+            diffs.append(f"source_hash {old['source_hash']} -> {stamp['source_hash']} (the strategy's code changed)")
+        if old["bankroll"] != bankroll:
+            diffs.append(f"bankroll {old['bankroll']} -> {bankroll}")
+        if old["assets"] != a:
+            diffs.append(f"markets {old['assets']} -> {a}")
+        if (last is None or diffs or last["code_version"] != stamp["code_version"]
+                or last["source_hash"] != stamp["source_hash"] or last["config_version"] != stamp["config_version"]):
+            self._add_version(name, cls, p, bankroll, a, ts, stamp)
+            self.db.commit()
+        if diffs:
+            return (f"Strategy '{name}' already exists in the database with different settings: "
+                    + "; ".join(diffs) + f". Its history will be mixed. Give it a new name (e.g. '{name}_v2') if "
+                    f"you changed the logic, parameters, bankroll or markets.")
         return None
+
+    def _add_version(self, name, cls, params_json, bankroll, assets_json, ts, stamp: dict):
+        self.db.execute("INSERT INTO strategy_versions VALUES (?,?,?,?,?,?,?,?,?,?)",
+                        (ts, name, cls, params_json, bankroll, assets_json, stamp.get("code_version"),
+                         stamp.get("params_hash"), stamp.get("source_hash"), stamp.get("config_version")))
 
     def log_fill(self, f: Fill) -> int:
         """Returns the fill's rowid (used to attach the fair value 5s later)."""
         meta = dict(getattr(f, "meta", None) or {})
-        extra = {k: v for k, v in meta.items() if k not in FILL_META}
+        extra = {k: v for k, v in meta.items() if k not in FILL_META and k not in FILL_ORDER}
+        stamp = self.stamp_of(f.strategy)
         cur = self.db.execute(
             f"INSERT INTO fills ({','.join(FILL_COLS)}) VALUES ({','.join('?' * len(FILL_COLS))})",
             (f.ts, f.strategy, f.asset, f.slug, f.window_end, f.outcome, f.side,
              f.shares, f.avg_price, f.usd, f.fee, f.reason,
              getattr(f, "theta", None), getattr(f, "rebate", 0.0), getattr(f, "liquidity", "taker"))
             + tuple(meta.get(k) for k in FILL_META)
-            + (json.dumps(extra, default=str, separators=(",", ":")) if extra else None,))
+            + (json.dumps(extra, default=str, separators=(",", ":")) if extra else None,)
+            + tuple(stamp.get(k) for k in FILL_STAMP) + tuple(meta.get(k) for k in FILL_ORDER))
         return cur.lastrowid
+
+    # ---------------------------------------------------------------- order log (core/orderlog.py)
+    def log_order(self, row: dict) -> int:
+        cur = self.db.execute(f"INSERT INTO orders ({','.join(ORDER_COLS)}) VALUES "
+                              f"({','.join('?' * len(ORDER_COLS))})", tuple(row.get(c) for c in ORDER_COLS))
+        return cur.lastrowid
+
+    def bump_order(self, order_id: int, ts: float):
+        """The same order failed the same way again: count it on the existing row."""
+        self.db.execute("UPDATE orders SET attempts = attempts + 1, last_ts = ? WHERE id = ?", (ts, order_id))
+
+    def update_order(self, order_id: int, fields: dict):
+        """Progress of a resting maker bid (its own row: fills arrive later, or it is cancelled)."""
+        cols = [c for c in fields if c in ORDER_COLS]
+        if cols:
+            self.db.execute(f"UPDATE orders SET {', '.join(c + ' = ?' for c in cols)} WHERE id = ?",
+                            tuple(fields[c] for c in cols) + (order_id,))
 
     def set_fill_followup(self, rowid: int, fv_after: float):
         self.db.execute("UPDATE fills SET fv_after_5s=? WHERE rowid=?", (fv_after, rowid))
@@ -187,8 +318,10 @@ class Storage:
         return len(rows)
 
     def log_settlement(self, s: Settlement):
-        d = asdict(s)
-        self.db.execute("INSERT INTO settlements VALUES (?,?,?,?,?,?,?,?,?,?)", tuple(d.values()))
+        stamp = self.stamp_of(s.strategy)
+        d = {**asdict(s), **{k: stamp.get(k) for k in ("code_version", "params_hash", "config_version")}}
+        self.db.execute(f"INSERT INTO settlements ({','.join(SETTLE_COLS)}) VALUES "
+                        f"({','.join('?' * len(SETTLE_COLS))})", tuple(d[c] for c in SETTLE_COLS))
 
     def log_equity(self, ts, strategy, cash, open_value):
         self.db.execute("INSERT INTO equity VALUES (?,?,?,?,?)", (ts, strategy, cash, open_value, cash + open_value))

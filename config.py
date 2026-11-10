@@ -12,6 +12,8 @@ import os
 
 import yaml
 
+from core.version import stable_hash
+
 from strategies.s1_fair_value import FairValueTrader
 from strategies.s2_market_maker import MarketMaker
 from strategies.s3_sniper import Sniper
@@ -19,6 +21,7 @@ from strategies.s4_momentum import CrowdMomentum, MinuteBuckets
 from strategies.s5_complete_set import CompleteSetArb
 from strategies.s6_mean_reversion import ShockReversion
 from strategies.s7_nested_pair import NestedPair
+from strategies.controls import BucketsFavorite, MomentumFavorite, ShockRandom, SniperFavorite
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 CONFIG_PATH = os.environ.get("PAPER_CONFIG") or os.path.join(HERE, "config.yaml")
@@ -33,6 +36,11 @@ REGISTRY = {
     "s5_complete_set": CompleteSetArb,
     "s6_mean_reversion": ShockReversion,
     "s7_nested_pair": NestedPair,
+    # no-signal controls (strategies/controls.py); paired with their strategies in config.yaml `controls:`
+    "ctl_sniper_favorite": SniperFavorite,
+    "ctl_momentum_favorite": MomentumFavorite,
+    "ctl_buckets_favorite": BucketsFavorite,
+    "ctl_shock_random": ShockRandom,
 }
 
 WINDOW_LENGTHS = {"5m": 300, "15m": 900, "1h": 3600}
@@ -44,6 +52,7 @@ def load(path: str = CONFIG_PATH) -> dict:
 
 
 RAW = load()
+CONFIG_VERSION = stable_hash(RAW)          # recorded with every strategy / fill (core/version.py)
 _eng = RAW.get("engine", {}) or {}
 _fees = RAW.get("fees", {}) or {}
 _fills = RAW.get("fills", {}) or {}
@@ -78,6 +87,8 @@ SPOT = {**(RAW.get("spot") or {}),
         "symbol": ASSETS[0].get("spot_symbol", "btcusdt") if ASSETS else "btcusdt"}
 MODEL = RAW.get("model", {}) or {}
 RISK = RAW.get("risk", {}) or {}
+VALIDITY = RAW.get("validity", {}) or {}      # round-validity thresholds (core/validity.py)
+HEALTH = RAW.get("health", {}) or {}          # clock-drift / uptime monitor (core/health.py)
 FEE_MODEL = _fees.get("model", "auto")
 FEE_PEAK = float(_fees.get("fee_peak", 0.0156))
 MAKER_REBATE_THETA = float(_fees.get("maker_rebate_theta", 0.0) or 0.0)
@@ -138,3 +149,10 @@ def build_strategies(raw: dict) -> list:
 
 
 STRATEGIES = build_strategies(RAW)
+
+# strategy name -> the name of its no-signal control (tools/validate.py reports strategy minus control)
+CONTROLS = dict(RAW.get("controls") or {})
+_names = {s.name for s in STRATEGIES}
+for _s, _c in CONTROLS.items():
+    if _s in _names and _c not in _names:
+        raise ValueError(f"config.yaml controls: {_s!r} is paired with {_c!r}, which is not an enabled strategy name")

@@ -39,6 +39,7 @@ import types
 from dataclasses import dataclass
 from typing import Optional
 
+from core import validity
 from core.broker import PaperBroker  # noqa: F401  (documented dependency: the real broker is used unchanged)
 from core.engine import Engine
 from core.fairvalue import MarketData
@@ -431,7 +432,7 @@ def run_replay(config_module, src_path: str, out_path: str, t0: float, t1: float
                ws_path: Optional[str] = None, sigma_mode: str = "recorded", latency_book: str = "same",
                progress=None, keep_snapshots: bool = False, warm_start: bool = True,
                ws_book_path: Optional[str] = None, latency_ms: Optional[float] = None,
-               ws_book_max_age: float = 60.0) -> Engine:
+               ws_book_max_age: float = 60.0, extra_slippage: Optional[float] = None) -> Engine:
     """Replay recorded ticks in [t0, t1) into `out_path`. The source is opened read-only."""
     import os
     if os.path.abspath(out_path) == os.path.abspath(src_path):
@@ -442,8 +443,11 @@ def run_replay(config_module, src_path: str, out_path: str, t0: float, t1: float
     cfg = types.SimpleNamespace(**{k: getattr(config_module, k) for k in dir(config_module) if k.isupper()})
     cfg.DB_PATH = out_path
     cfg.EXPORT_DIR = None
+    cfg.HEALTH = {"enabled": False}                 # a replay is not a bot run: no heartbeat rows, no clock readings
     if latency_ms is not None:                      # replay-only override (calibration sweep); the live bot is untouched
         cfg.LATENCY_SECONDS = float(latency_ms) / 1000.0
+    if extra_slippage:                              # replay-only pessimism: added to fills.extra_slippage (per share)
+        cfg.EXTRA_SLIPPAGE = float(getattr(cfg, "EXTRA_SLIPPAGE", 0.0) or 0.0) + float(extra_slippage)
     src = Source(src_path)
     clock = ReplayClock(t0)
     ws_books = WsBookReader(ws_book_path, ws_book_max_age) if latency_book == "ws" and ws_book_path else None
@@ -466,6 +470,13 @@ def run_replay(config_module, src_path: str, out_path: str, t0: float, t1: float
         engine_names = [s.name for s in strategies]
         src.copy_state(store.db, t0, engine_names)
     engine = Engine(cfg, strategies, feed, store, clock=clock.now, sleep=clock.sleep, market_data=md)
+    # Round validity: the replay output has no snapshots of its own, so the verdicts are taken from the recording
+    # (its own round_validity rows where it has them, otherwise computed from its snapshots; the source stays
+    # read-only) and the engine does not assess rounds itself.
+    engine.assess_validity = False
+    engine.validity_counts = validity.backfill(src.db, store.db, getattr(cfg, "POLL_SECONDS", 2),
+                                               getattr(cfg, "VALIDITY", None), now=t1, since=t0 - 6 * 3600,
+                                               until=t1 + 3600, source="replay")
     if ws_path:
         def exch_of(slug):
             w = src.windows.get(slug)
@@ -497,3 +508,39 @@ def run_replay(config_module, src_path: str, out_path: str, t0: float, t1: float
         ws_books.db.close()
     engine.ticks_replayed = n
     return engine
+
+
+def resolve_profile(raw_config: dict, name: Optional[str], ws_db: Optional[str] = None,
+                    latency_ms: Optional[float] = None, latency_book: Optional[str] = None) -> dict:
+    """
+    A named replay profile from config.yaml (`replay: profiles:`), e.g. `pessimistic`: +1c extra slippage per share
+    and a 1000 ms order latency. Explicit command-line values win over the profile's.
+    latency_book "auto": the websocket latency book when a recording is available (the latency then really moves
+    the fill to a later book), otherwise "next" = the next recorded book (~2 s later: stricter than 1000 ms).
+    Returns {extra_slippage, latency_ms, latency_book, ws_db, note}.
+    """
+    import os
+    out = {"extra_slippage": None, "latency_ms": latency_ms, "latency_book": latency_book, "ws_db": ws_db, "note": ""}
+    if not name:
+        return out
+    profiles = ((raw_config or {}).get("replay") or {}).get("profiles") or {}
+    if name not in profiles:
+        raise ValueError(f"unknown replay profile {name!r} (config.yaml replay.profiles has: {sorted(profiles)})")
+    p = profiles[name] or {}
+    out["extra_slippage"] = float(p.get("extra_slippage", 0.0) or 0.0)
+    if latency_ms is None and p.get("latency_ms") is not None:
+        out["latency_ms"] = float(p["latency_ms"])
+    book = latency_book or p.get("latency_book", "auto")
+    if book == "auto":
+        cand = ws_db or "data/ws_events.db"
+        if os.path.exists(cand):
+            book, out["ws_db"] = "ws", cand
+        else:
+            book = "next"
+    out["latency_book"] = book
+    how = {"ws": f"the websocket book {out['latency_ms']:g} ms after the decision",
+           "next": "the NEXT recorded book (~2 s after the decision; no websocket recording was given)",
+           "same": "the decision-time book (the latency does not change the book: weaker test)"}[book]
+    out["note"] = (f"profile {name}: +{out['extra_slippage'] * 100:g}c extra slippage per share, order latency "
+                   f"{out['latency_ms']:g} ms, fills against {how}")
+    return out

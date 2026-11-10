@@ -400,3 +400,33 @@ class WsLatencyRegression(unittest.TestCase):
         before = digest(self.empty_ws)
         self.run_("ws_ro", latency_book="ws", ws_book_path=self.empty_ws)
         self.assertEqual(before, digest(self.empty_ws))
+
+
+class ProfileTests(unittest.TestCase):
+    RAW = {"replay": {"profiles": {"pessimistic": {"extra_slippage": 0.01, "latency_ms": 1000, "latency_book": "auto"}}}}
+
+    def test_pessimistic_profile_without_a_websocket_recording_uses_the_next_book(self):
+        from core.replay import resolve_profile
+        p = resolve_profile(self.RAW, "pessimistic", ws_db=os.path.join(tempfile.mkdtemp(), "missing.db"))
+        self.assertEqual((p["extra_slippage"], p["latency_ms"], p["latency_book"]), (0.01, 1000.0, "next"))
+        self.assertIn("+1c", p["note"])
+
+    def test_explicit_values_win_and_ws_recording_is_used_when_present(self):
+        from core.replay import resolve_profile
+        ws = os.path.join(tempfile.mkdtemp(), "ws.db")
+        open(ws, "w").close()
+        p = resolve_profile(self.RAW, "pessimistic", ws_db=ws, latency_ms=500)
+        self.assertEqual((p["latency_ms"], p["latency_book"], p["ws_db"]), (500, "ws", ws))
+        self.assertEqual(resolve_profile(self.RAW, "pessimistic", latency_book="same")["latency_book"], "same")
+
+    def test_no_profile_changes_nothing_and_unknown_profile_is_an_error(self):
+        from core.replay import resolve_profile
+        p = resolve_profile(self.RAW, None, latency_ms=250, latency_book="same")
+        self.assertEqual((p["extra_slippage"], p["latency_ms"], p["latency_book"], p["note"]), (None, 250, "same", ""))
+        with self.assertRaises(ValueError):
+            resolve_profile(self.RAW, "optimistic")
+
+    def test_config_has_the_pessimistic_profile(self):
+        import config
+        p = config.RAW["replay"]["profiles"]["pessimistic"]
+        self.assertEqual((p["extra_slippage"], p["latency_ms"]), (0.01, 1000))

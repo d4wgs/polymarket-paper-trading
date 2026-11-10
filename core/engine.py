@@ -22,9 +22,12 @@ import os
 import time
 from collections import defaultdict
 
+from core import validity, version
 from core.broker import PaperBroker
 from core.fees import ET, et_day, fee_model_name, make_fee_model
+from core.health import Health
 from core.maker import MakerBook
+from core.orderlog import OrderLog, book_view
 from core.models import CANCEL, MAKER_BID, Order, Position, Snapshot, UP, DOWN, books_consistent
 from core.risk import RiskManager
 from core.storage import Storage
@@ -84,6 +87,10 @@ class Engine:
         self._last_skip_log = 0.0
         self.latest: dict[str, Snapshot] = {}                                # asset -> its latest snapshot
         self._equity_last: dict[str, tuple] = {}                             # strategy -> (cash, open value, saved at)
+        self.orders = OrderLog(storage)                                      # logging only (core/orderlog.py)
+        self.assess_validity = True                                          # replay turns this off (it copies verdicts)
+        self.health = Health(storage, getattr(cfg, "HEALTH", None), clock)   # clock drift + uptime; never halts trading
+        self._last_reject: str | None = None                                 # reason of the latest risk rejection
 
     def _setting(self, name, default):
         return getattr(self.cfg, name, default)
@@ -94,9 +101,15 @@ class Engine:
         if len(names) != len(set(names)):
             raise ValueError(f"Strategy names must be unique: {names}")
         now = self.clock()
+        self.maker.on_close = lambda q, why: self.orders.quote_closed(q, why, self.clock())   # order log only
+        config_version = self._setting("CONFIG_VERSION", None)
+        self.store.run_stamp = {"code_version": version.code_version(), "config_version": config_version}
+        log.info("Code version %s, config version %s", version.code_version(), config_version or "-")
+        self.health.start(now, version.code_version())       # a bot start is recorded (and invalidates the round it is in)
         for s in self.strategies:
             bankroll = s.bankroll or self.cfg.STARTING_BANKROLL
-            warn = self.store.register_strategy(s.name, type(s).__name__, s.p, bankroll, s.assets, now)
+            warn = self.store.register_strategy(s.name, type(s).__name__, s.p, bankroll, s.assets, now,
+                                                stamp=version.strategy_stamp(s, config_version))
             if warn:
                 log.warning(warn)
             b = PaperBroker(s.name, bankroll, self.cfg.EXTRA_SLIPPAGE, fee_model=make_fee_model(self.cfg))
@@ -139,6 +152,35 @@ class Engine:
                 self.winners.setdefault(r["slug"], r["winner"])
         if self.provisional:
             log.info("%d settled round(s) still waiting for Polymarket's official result", len(self.provisional))
+        self._validity_catch_up(now)
+
+    # ------------------------------------------------------------------ round validity (core/validity.py)
+    def _mark_validity(self, slug: str, asset: str, window_end: float, now: float):
+        """Store the data-coverage verdict of a finished round (once; statistics leave invalid rounds out)."""
+        if not self.assess_validity:
+            return
+        try:
+            start = _slug_start(slug) or (window_end - validity.window_seconds(asset))
+            row = validity.assess_round(self.store.db, slug, asset, start, window_end,
+                                        self._setting("POLL_SECONDS", 2), self._setting("VALIDITY", None))
+            if validity.record(self.store.db, row, now, "live") and not row["valid"]:
+                log.warning("%s is marked INVALID for statistics (%s): %d of %.0f ticks, longest gap %.0fs",
+                            slug, row["reason"], row["ticks"], row["expected"], row["max_gap"])
+        except Exception:
+            log.exception("Round validity check failed for %s", slug)
+
+    def _validity_catch_up(self, now: float):
+        """Rounds that ended while the bot was restarting never pass through _settle: give them a verdict too."""
+        if not self.assess_validity:
+            return
+        try:
+            n = validity.backfill(self.store.db, self.store.db, self._setting("POLL_SECONDS", 2),
+                                  self._setting("VALIDITY", None), now, since=now - KEEP_SECONDS, source="live")
+            if n["added"]:
+                log.info("Round validity: %d earlier round(s) checked, %d invalid %s", n["added"], n["invalid"],
+                         n["reasons"] or "")
+        except Exception:
+            log.exception("Round validity catch-up failed")
 
     # ------------------------------------------------------------------ loop
     def run(self, max_seconds: float | None = None):
@@ -180,6 +222,7 @@ class Engine:
             self._prune_books(now)
             self._last_book_prune = now
         self._daily_export(now)
+        self.health.tick(now)
         self.store.commit()
 
     def _log_stats(self, info, now: float):
@@ -214,6 +257,7 @@ class Engine:
         up, down = self._fetch_books(info, now)
         if up is None:
             return
+        self.health.sample(self.clock(), up.ts)              # our clock vs the exchange's timestamp on this book
         index_fn = getattr(self.feed, "index_price", None)
         index = None
         if index_fn is not None:
@@ -243,7 +287,7 @@ class Engine:
             for s in self.strategies:
                 self.state[(s.name, asset)] = {}
                 if old:
-                    self.maker.cancel(s.name, old)            # quotes don't outlive their round
+                    self.maker.cancel(s.name, old, why="round_end")   # quotes don't outlive their round
 
         prev_winner = self._prev_winner(info, now)
         prev_windows = self._recent_results(info)
@@ -305,6 +349,8 @@ class Engine:
                     self.store.log_event(now, s.name, asset, info.slug, "order_dropped",
                                          {"why": "no consistent book after latency", "outcome": order.outcome,
                                           "side": order.side, "reason": order.reason})
+                    self.orders.record(s.name, order, dsnap, exec_ts=self.clock(), status="unfilled",
+                                       reason="latency_book_empty", stamp=self.store.stamp_of(s.name))
                     continue
                 if s.name not in books:     # private copy per strategy so strategies don't share liquidity
                     books[s.name] = {UP: exec_snap.up.copy(), DOWN: exec_snap.down.copy()}
@@ -412,6 +458,7 @@ class Engine:
     def _risk_check(self, s, broker, order, snap):
         """None = rejected; else the order (possibly clipped). Closing trades are never blocked."""
         m = snap.market
+        self._last_reject = None
         pos = broker.positions.get(m.slug)
         if order.side == "SELL":
             return order
@@ -430,6 +477,7 @@ class Engine:
                                   market_cost=pos.net_cost if pos else 0.0, open_markets=open_markets,
                                   in_this_market=in_market, equity=broker.equity(self.marks), hedge=hedge)
         if not dec.ok:
+            self._last_reject = dec.reason
             key = (s.name, m.slug, dec.reason)
             if snap.ts - self._reject_logged.get(key, 0.0) >= 60:     # one event per minute per reason
                 self._reject_logged[key] = snap.ts
@@ -466,18 +514,33 @@ class Engine:
                               "seconds_left": round(exec_snap.seconds_left, 1), "reason": order.reason})
 
     def _execute_taker(self, s, broker, order, dsnap, exec_snap, books):
+        stamp = self.store.stamp_of(s.name)
         checked = self._risk_check(s, broker, order, exec_snap)
         if checked is None:
+            self.orders.record(s.name, order, dsnap, exec_ts=exec_snap.ts, status="rejected", reason="risk_limit",
+                               detail=self._last_reject, stamp=stamp)
             return []
+        # order log (read-only): what the broker is about to fill against, and what the account holds
+        pos = broker.positions.get(exec_snap.market.slug)
+        held = (pos.shares(order.outcome) if pos is not None else 0.0) if order.side == "SELL" else None
+        cash = broker.cash
+        exec_view = book_view(books[order.outcome], order.side, order.limit)
         try:
             fills = broker.execute_many(checked, exec_snap, books)
         except Exception:
             log.exception("Strategy %s sent a bad order %s; skipped", s.name, order)
+            self.orders.record(s.name, order, dsnap, exec_ts=exec_snap.ts, exec_view=exec_view, status="rejected",
+                               reason="bad_order", stamp=stamp)
             return []
         if not fills:
             self._log_unfilled(s, checked, dsnap, exec_snap)
+        order_id = self.orders.record(s.name, order, dsnap, exec_ts=exec_snap.ts, exec_view=exec_view, fills=fills,
+                                      held=held, cash=cash, clipped=checked if checked is not order else None,
+                                      stamp=stamp)
+        d_depth = book_view(dsnap.up if order.outcome == UP else dsnap.down, order.side, order.limit)[2]
         for fill in fills:
             fill.meta = self._fill_meta(fill, dsnap, dsnap.ts, extra=order.meta)
+            fill.meta.update(self.orders.fill_columns(order_id, fill, dsnap, d_depth))
             self.store.log_fill(fill)
             log.info("[%s] %s %s %.2f sh @ %.3f ($%.2f, fee $%.2f) fair %s edge %s | %s",
                      s.name, fill.side, fill.outcome, fill.shares, fill.avg_price, fill.usd, fill.fee,
@@ -486,18 +549,28 @@ class Engine:
 
     def _place_quote(self, s, broker, order, snap):
         m = snap.market
+        stamp = self.store.stamp_of(s.name)
         if self.risk.kill_active:
             self.maker.cancel(s.name, m.slug, order.outcome)
+            self.orders.record(s.name, order, snap, kind="maker", status="rejected", reason="risk_limit",
+                               detail="kill switch (basis / feed)", stamp=stamp)
             return
         checked = self._risk_check(s, broker, order, snap)
         if checked is None or not checked.shares:
             self.maker.cancel(s.name, m.slug, order.outcome)
+            self.orders.record(s.name, order, snap, kind="maker", status="rejected", reason="risk_limit",
+                               detail=self._last_reject, stamp=stamp)
             return
         book = snap.up if order.outcome == UP else snap.down
         fv = snap.fv
-        self.maker.place(s.name, m.slug, m.asset, order.outcome, order.limit, checked.shares, snap.ts, book,
-                         reason=order.reason,
-                         meta={**order.meta, "fv_at_quote": fv.of(order.outcome) if fv else None})
+        q = self.maker.place(s.name, m.slug, m.asset, order.outcome, order.limit, checked.shares, snap.ts, book,
+                             reason=order.reason,
+                             meta={**order.meta, "fv_at_quote": fv.of(order.outcome) if fv else None})
+        if q is None:
+            self.orders.record(s.name, order, snap, kind="maker", status="rejected", reason="would_cross",
+                               stamp=stamp)
+        else:
+            self.orders.quote_placed(s.name, checked, snap, q, stamp=stamp)
 
     def _maker_fills(self, s, broker, snap):
         m = snap.market
@@ -505,9 +578,11 @@ class Engine:
         for q, shares in hits:
             fills = broker.fill_maker(q.outcome, shares, q.price, snap, rebate_theta=self.maker_rebate_theta,
                                       reason=q.reason or "maker bid traded through")
+            self.orders.quote_filled(q, fills, snap.ts)
             for fill in fills:
                 extra = {**q.meta, "quote_price": q.price, "quoted_at": q.placed_ts, "queue_left": q.queue_ahead}
                 fill.meta = self._fill_meta(fill, snap, snap.ts, extra=extra)
+                fill.meta.update(self.orders.quote_fill_columns(q, fill))
                 rowid = self.store.log_fill(fill)
                 if snap.fv is not None:
                     self.followups.append((snap.ts + self.followup_seconds, rowid, m.slug, fill.outcome))
@@ -672,6 +747,7 @@ class Engine:
         # Every round's result is saved (not only rounds someone traded): restarts rebuild recent results
         # from it, and it is the ground truth for studying / replaying the logged order books.
         self.store.log_resolution(slug, asset, window_end, winner, OFFICIAL if official else 0, now)
+        self._mark_validity(slug, asset, window_end, now)
         if not official:
             self.provisional[slug] = [asset, window_end, now]
         self.marks.pop(slug, None)
@@ -735,6 +811,7 @@ class Engine:
         if self.md is not None:
             self.md.prune(now - 600)
         self._reject_logged = {k: v for k, v in self._reject_logged.items() if now - v < 3600}
+        self.orders.prune(_slug_start, cutoff)
         self._stats_last = {k: v for k, v in self._stats_last.items() if _slug_start(k) >= cutoff}
 
     def _check_stop(self, name: str, broker: PaperBroker, now: float) -> bool:

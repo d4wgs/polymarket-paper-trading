@@ -388,3 +388,51 @@ class RetiredStrategyTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class DistributionModeTests(unittest.TestCase):
+    """Normal vs Student-t (model.distribution): both are probabilities, both rise with spot - strike, and the
+    Student-t (rescaled to unit variance) keeps more probability in the tails."""
+
+    SIGMA, T = 4e-5, 240.0
+
+    def p_up(self, gap_bps, dist, avg=0.0, t=None):
+        from core.fairvalue import fair_value, fair_value_averaged
+        K = 100_000.0
+        S = K * (1 + gap_bps / 1e4)
+        t = self.T if t is None else t
+        if avg:
+            return fair_value_averaged(S, K, self.SIGMA, t, avg, dist=dist, df=4)[0]
+        return fair_value(S, K, self.SIGMA, t, dist=dist, df=4)[0]
+
+    def test_both_modes_are_probabilities_and_monotonic_in_the_gap(self):
+        gaps = [g / 2 for g in range(-400, 401)]                       # -200 .. +200 bps in 0.5 bp steps
+        for dist in ("normal", "student_t"):
+            for avg, t in ((0.0, None), (60.0, None), (60.0, 20.0)):   # point, averaged, inside the final minute
+                ps = [self.p_up(g, dist, avg, t) for g in gaps]
+                self.assertTrue(all(0.0 <= p <= 1.0 for p in ps), (dist, avg, t))
+                self.assertTrue(all(b >= a - 1e-15 for a, b in zip(ps, ps[1:])), (dist, avg, t))
+                self.assertLess(ps[0], 0.01)
+                self.assertGreater(ps[-1], 0.99)
+                self.assertAlmostEqual(self.p_up(0.0, dist, avg, t), 0.5, places=12)
+                self.assertAlmostEqual(self.p_up(7.0, dist, avg, t) + self.p_up(-7.0, dist, avg, t), 1.0, places=3)   # ~symmetric
+
+    def test_student_t_has_fatter_tails_than_the_normal(self):
+        from core.fairvalue import norm_cdf, unit_variance_t_cdf
+        for z in (2.5, 3.0, 4.0, 6.0):                                  # far from the strike: more tail mass
+            self.assertGreater(1 - unit_variance_t_cdf(z, 4), 1 - norm_cdf(z))
+            self.assertGreater(unit_variance_t_cdf(-z, 4), norm_cdf(-z))
+        self.assertGreater((1 - unit_variance_t_cdf(3.0, 4)) / (1 - norm_cdf(3.0)), 3.0)
+        # same variance, so it is MORE peaked near the strike (a small gap is priced more confidently)
+        self.assertGreater(unit_variance_t_cdf(0.5, 4), norm_cdf(0.5))
+        # in price terms: a far out-of-the-money side keeps a higher fair value under the Student-t
+        self.assertGreater(self.p_up(-25.0, "student_t"), self.p_up(-25.0, "normal"))
+
+    def test_the_sign_of_the_gap_decides_the_favourite_in_both_modes(self):
+        """Why s3_sniper_v3d kept its name: P(Up) >= 0.5 is the same test under either distribution."""
+        for g in (-50, -3, -0.01, 0.0, 0.01, 3, 50):
+            self.assertEqual(self.p_up(g, "normal") >= 0.5, self.p_up(g, "student_t") >= 0.5)
+
+    def test_config_uses_student_t_df4(self):
+        import config
+        self.assertEqual((config.MODEL.get("distribution"), config.MODEL.get("student_t_df")), ("student_t", 4))

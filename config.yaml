@@ -31,7 +31,11 @@ model:
   vol_half_life_seconds: 300          # EWMA half-life of 1-second log returns
   vol_min_samples: 30                 # sigma unavailable until this many returns (unless seeded)
   sigma_multiplier: 1.0               # > 1 inflates vol for fat-tail safety
-  distribution: normal                # normal | student_t
+  # 2026-11-09: switched normal -> student_t (df 4). Recorded 3-sigma moves happened ~2% of the time vs 0.27%
+  # under the normal; df 4 improved the model's Brier score 0.1613 -> 0.1601 (the market mid: 0.1577).
+  # df = 4 was chosen on the SAME data the strategies are evaluated on. It is a FIXED design choice from now on:
+  # do not re-tune it. Strategies whose decisions use the model were renamed with a _t4 suffix (see below).
+  distribution: student_t             # normal | student_t
   student_t_df: 4                     # degrees of freedom (student_t only; rescaled to unit variance)
   min_seconds: 1                      # t is floored at this
   require_published_k: true           # no fair value (no trading) until the exchange publishes K, a few
@@ -75,6 +79,32 @@ risk:
   max_open_markets: 4
   basis_kill_pct: 0.05                # |60s-avg spot - oracle| / oracle in PERCENT (0.05 = 0.05%) -> kill switch
   require_both_feeds: true            # missing spot or oracle price also trips the kill switch
+
+# ---------------------------------------------------------------- round validity (core/validity.py)
+# A round counts in the statistics only if it was recorded well enough. DATA COVERAGE ONLY: the rule never looks at
+# P&L or results and is the same for every strategy. Invalid rounds keep all their data; statistics leave them out
+# by default and say how many (tools: --include-invalid). Evidence (716 rounds, 2026-11-07..09): worst gap per
+# round p99 = 8.8s (5m) / 12.3s (15m), outages 132-264s; these thresholds marked 19 rounds (2.7%).
+validity:
+  max_gap_seconds: 10                 # a longer hole between two recorded ticks (or at the round's start / end)
+  min_coverage: 0.90                  # recorded ticks / expected ticks (round length / engine.poll_seconds)
+  max_missing_share: 0.10             # share of ticks without a spot price, or without a model fair value
+                                      # also invalid: the bot (re)started during the round; a CRITICAL clock-drift alert
+
+# ---------------------------------------------------------------- health: clock drift + uptime (core/health.py)
+# Observes and records only; it never stops trading. `python tools/health.py` shows the current state.
+health:
+  enabled: true
+  check_seconds: 60                   # one clock reading a minute (stored in the `health` table)
+  heartbeat_seconds: 60               # bot_runs.last_seen refresh (uptime / downtime)
+  method: both                        # exchange | ntp | both
+                                      #   exchange: this clock vs the exchange's timestamp on every book poll (no extra
+                                      #             requests); reading = smallest offset of the minute - expected latency
+                                      #   ntp:      is the system clock still NTP-synchronized (timedatectl)?
+  warn_seconds: 0.5                   # |drift| at or above this -> warning + events row
+  critical_seconds: 1.5               # ... at or above this -> critical: overlapping rounds are marked invalid
+  expected_latency_seconds: 0.15      # network + processing delay of the FASTEST poll in a minute (Pi: p1 = 0.11s)
+  min_samples: 5                      # fewer book polls than this in a minute -> no reading (level "nodata")
 
 # ---------------------------------------------------------------- portfolio
 portfolio:
@@ -127,6 +157,15 @@ recorder:
 # ---------------------------------------------------------------- replay options
 replay:
   ws_book_max_age_s: 60               # --latency-book ws: a websocket book older than this at decision+latency is not used (fallback)
+  # Named profiles: `python tools/replay.py --profile pessimistic` / `python tools/validate.py --profile pessimistic`.
+  # THE PESSIMISTIC RULE (docs/PASS_CRITERIA.md): a candidate must still pass when replayed with +1c extra slippage
+  # per share and a 500-1000 ms order latency. The profile uses the hard end (1000 ms); --latency-ms 500 overrides.
+  profiles:
+    pessimistic:
+      extra_slippage: 0.01            # added to fills.extra_slippage for the replay only
+      latency_ms: 1000
+      latency_book: auto              # ws (book rebuilt at decision + latency) if a websocket recording exists,
+                                      # otherwise next (the next recorded book, ~2 s later: stricter)
 
 # ---------------------------------------------------------------- tools/validate.py (holdout validation)
 validate:
@@ -294,10 +333,26 @@ strategies:
 
   s4_momentum_edge:
     class: s4_momentum
-    enabled: true
+    enabled: false                    # RETIRED 2026-11-09: ran on the normal model. Replaced by s4_momentum_edge_t4
+                                      # below (same parameters, Student-t model). History stays in the database.
     name: s4_momentum_edge0_v1
     title: "S4·E · Momentum, model edge ≥ 0"
     description: "S4 but also requires the fair-value model to see non-negative edge after fees."
+    markets: [5m, 15m]
+    params:
+      min_side_price: 0.70
+      max_entry: 0.90
+      min_edge: 0.0
+      skip_first_seconds: 30
+      skip_last_seconds: 10
+      stake_usd: 25
+
+  s4_momentum_edge_t4:
+    class: s4_momentum
+    enabled: true
+    name: s4_momentum_edge0_v1_t4     # = s4_momentum_edge0_v1 on the Student-t (df 4) model: its edge gate uses the model
+    title: "S4·E · Momentum, model edge ≥ 0 (t4)"
+    description: "S4 but also requires the fair-value model (Student-t, df 4) to see non-negative edge after fees."
     markets: [5m, 15m]
     params:
       min_side_price: 0.70
@@ -351,10 +406,27 @@ strategies:
       stake_usd: 50                   # leg 1 dollars
 
   s6_mean_reversion:
-    enabled: true
+    enabled: false                    # RETIRED 2026-11-09: ran on the normal model. Replaced by s6_mean_reversion_t4.
     name: s6_shock_reversion_v1
     title: "S6 · Shock mean reversion"
     description: "Fades a >= 12c price jump in 10s that fair value didn't confirm; exits at 50% reversion or 60s."
+    markets: [5m]
+    params:
+      shock_size: 0.12
+      shock_lookback: 10
+      max_fair_move: 0.04
+      min_edge: 0.03
+      exit_mode: revert
+      gap_close_frac: 0.5
+      time_stop_seconds: 60
+      stake_usd: 25
+
+  s6_mean_reversion_t4:
+    class: s6_mean_reversion
+    enabled: true
+    name: s6_shock_reversion_v1_t4    # = s6_shock_reversion_v1 on the Student-t (df 4) model (fair-value move + edge)
+    title: "S6 · Shock mean reversion (t4)"
+    description: "Fades a >= 12c price jump in 10s that fair value (Student-t, df 4) didn't confirm; exits at 50% reversion or 60s."
     markets: [5m]
     params:
       shock_size: 0.12
@@ -386,7 +458,7 @@ strategies:
 
   s7_nested_pair_ev:
     class: s7_nested_pair
-    enabled: true
+    enabled: false                    # RETIRED 2026-11-09: ran on the normal model. Replaced by s7_nested_pair_ev_t4.
     name: s7_nested_pair_ev_v1
     title: "S7·EV · Nested pair, band EV"
     description: "S7 + also opens when 1 + model P(close between the two prices to beat) - pair cost >= 2c, up to $1.05 per pair. Not riskless."
@@ -402,3 +474,149 @@ strategies:
       min_seconds_left: 5
       min_pair_shares: 5
       stake_usd: 50
+
+  s7_nested_pair_ev_t4:
+    class: s7_nested_pair
+    enabled: true
+    name: s7_nested_pair_ev_v1_t4     # = s7_nested_pair_ev_v1 on the Student-t (df 4) model (P(band) comes from the model)
+    title: "S7·EV · Nested pair, band EV (t4)"
+    description: "S7 + also opens when 1 + model P(close between the two prices to beat) - pair cost >= 2c, up to $1.05 per pair. Not riskless."
+    markets: [5m, 15m]
+    params:
+      max_pair_cost: 0.99
+      band_ev: true
+      min_ev: 0.02
+      max_ev_pair_cost: 1.05
+      complete_slack: 0.03            # leg 2 allowed up to opening limit + 3c
+      leg1_market: 5m                 # leg 1 on the 5m tick; leg 2 on the 15m tick right after
+      max_other_age_seconds: 3
+      min_seconds_left: 5
+      min_pair_shares: 5
+      stake_usd: 50
+
+  # ===================================================================================
+  #  NO-SIGNAL CONTROLS (2026-11-09, strategies/controls.py). Same entry window, price band and stake as the
+  #  family, with the signal removed. Own name, own bankroll, own version stamp. A strategy is judged as
+  #  "strategy minus its control" on the rounds both traded (tools/validate.py; pairing in `controls:` below).
+  #  These are part of the frozen test design: don't tune them.
+  #  BANKROLL: $25,000 each, not $1,000. A control is EXPECTED to lose (it pays fees and spread with no signal): on
+  #  the recorded day ctl_s6_random lost $774 and ctl_s4_fav70 $511, and under the pessimistic replay both hit the
+  #  $200 stop within a day -- a stopped control is no control. The stake stays $25 per entry (stake_usd), so the
+  #  bankroll changes nothing about what a control trades or its per-round P&L; it only keeps it alive (about a
+  #  month at the worst observed rate). Judge controls in dollars per round, never in % return.
+  # ===================================================================================
+  ctl_s3_fav:
+    class: ctl_sniper_favorite
+    enabled: true
+    name: ctl_s3_fav
+    bankroll: 25000
+    title: "CTL · Sniper control (favourite)"
+    description: "Control for S3 v2 / v3a / v3d: in the last 60s buys the side with the higher ask. No index or model."
+    markets: [5m, 15m]
+    params:
+      snipe_seconds: 60
+      stake_usd: 25
+
+  ctl_s3_fav70:
+    class: ctl_sniper_favorite
+    enabled: true
+    name: ctl_s3_fav70
+    bankroll: 25000
+    title: "CTL · Sniper control (favourite, ask ≥ 70c)"
+    description: "Control for S3 v3b: the favourite in the last 60s, only if its ask is ≥ 70c."
+    markets: [5m, 15m]
+    params:
+      snipe_seconds: 60
+      min_price: 0.70
+      stake_usd: 25
+
+  ctl_s3_fav70_97:
+    class: ctl_sniper_favorite
+    enabled: true
+    name: ctl_s3_fav70_97
+    bankroll: 25000
+    title: "CTL · Sniper control (favourite, 70c–97c)"
+    description: "Control for S3 v3c: the favourite in the last 60s, only if its ask is 70c–97c."
+    markets: [5m, 15m]
+    params:
+      snipe_seconds: 60
+      min_price: 0.70
+      max_price: 0.97
+      stake_usd: 25
+
+  ctl_s4_fav70:
+    class: ctl_momentum_favorite
+    enabled: true
+    name: ctl_s4_fav70
+    bankroll: 25000
+    title: "CTL · Momentum control (favourite ≥ 70c)"
+    description: "Control for S4 v1 / edge / 15m: buys a side priced ≥ 70c (ask ≤ 90c), no spot or oracle confirmation."
+    markets: [5m, 15m]
+    params:
+      min_side_price: 0.70
+      max_entry: 0.90
+      skip_first_seconds: 30
+      skip_last_seconds: 10
+      stake_usd: 25
+
+  ctl_s4_fav80:
+    class: ctl_momentum_favorite
+    enabled: true
+    name: ctl_s4_fav80
+    bankroll: 25000
+    title: "CTL · Momentum control (favourite ≥ 80c)"
+    description: "Control for S4·80: buys a side priced ≥ 80c (ask ≤ 90c), no spot or oracle confirmation."
+    markets: [5m, 15m]
+    params:
+      min_side_price: 0.80
+      max_entry: 0.90
+      skip_first_seconds: 30
+      skip_last_seconds: 10
+      stake_usd: 25
+
+  ctl_s4b_fav:
+    class: ctl_buckets_favorite
+    enabled: true
+    name: ctl_s4b_fav
+    bankroll: 25000
+    title: "CTL · Minute-buckets control (favourite)"
+    description: "Control for S4b: at the start of the final minute (5m rounds) buys the favourite if ask ≤ 85c. No bucket test."
+    markets: [5m]
+    params:
+      max_entry: 0.85
+      entry_window_seconds: 10
+      min_side_price: 0.50
+      stake_usd: 25
+
+  ctl_s6_random:
+    class: ctl_shock_random
+    enabled: true
+    name: ctl_s6_random
+    bankroll: 25000
+    title: "CTL · Shock control (random side)"
+    description: "Control for S6: on the same ≥ 12c jump in 10s buys a seeded-random side; sells after 60s. No model."
+    markets: [5m]
+    params:
+      shock_size: 0.12
+      shock_lookback: 10
+      time_stop_seconds: 60
+      seed: 12345
+      stake_usd: 25
+
+# ---------------------------------------------------------------- strategy -> its control (paired comparison)
+# tools/validate.py reports, per strategy, the per-round P&L of the strategy minus this control on the rounds
+# BOTH have a final result in, with a bootstrap CI that resamples rounds. S7 has no control (the locked pair is
+# not a directional bet; compare the EV variant with the locked one).
+controls:
+  s3_sniper_v2: ctl_s3_fav
+  s3_sniper_v3a_floor50: ctl_s3_fav
+  s3_sniper_v3d_model_floor50: ctl_s3_fav
+  s3_sniper_v3b_floor70: ctl_s3_fav70
+  s3_sniper_v3c_floor70_cap97: ctl_s3_fav70_97
+  s4_momentum_v1: ctl_s4_fav70
+  s4_momentum_edge0_v1_t4: ctl_s4_fav70
+  s4_momentum_15m_v1: ctl_s4_fav70
+  s4_momentum_min80_v1: ctl_s4_fav80
+  s4b_minute_buckets_v1: ctl_s4b_fav
+  s4b_minute_buckets_v2: ctl_s4b_fav
+  s6_shock_reversion_v1_t4: ctl_s6_random

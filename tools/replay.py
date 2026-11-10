@@ -28,7 +28,7 @@ import pandas as pd
 
 import config
 from core import metrics
-from core.replay import Source, run_replay
+from core.replay import Source, resolve_profile, run_replay
 
 
 def parse_t(s: str) -> float:
@@ -163,7 +163,10 @@ def main():
     ap.add_argument("--ws-trades", nargs="?", const="data/ws_events.db", default=None, metavar="WS_DB",
                     help="maker fills from recorded websocket trade prints (default rule stays book trade-through)")
     ap.add_argument("--sigma", choices=["recorded", "ewma"], default="recorded")
-    ap.add_argument("--latency-book", choices=["next", "same", "ws"], default="same",
+    ap.add_argument("--profile", help="a named profile from config.yaml replay.profiles, e.g. `pessimistic` "
+                                      "(+1c slippage, 1000 ms latency, later book): every candidate must still "
+                                      "pass under it (docs/PASS_CRITERIA.md)")
+    ap.add_argument("--latency-book", choices=["next", "same", "ws"], default=None,
                     help="book used for the order latency fill: the decision book (default), the next recorded "
                          "one, or 'ws': rebuilt from the websocket recording at decision time + latency "
                          "(needs --ws-db; only valid for periods the recorder covered; falls back to the decision "
@@ -176,9 +179,17 @@ def main():
     ap.add_argument("--model-check", action="store_true",
                     help="also compare the replayed fair value with the recorded one, tick by tick")
     ap.add_argument("--self-check", action="store_true", help="compare with the live fills in the source DB")
+    ap.add_argument("--include-invalid", action="store_true",
+                    help="also count rounds marked invalid for data coverage (default: left out of the statistics)")
     args = ap.parse_args()
 
     logging.basicConfig(level=logging.WARNING, format="%(levelname)s %(name)s: %(message)s")
+    prof = resolve_profile(config.RAW, args.profile, args.ws_db or args.ws_trades, args.latency_ms, args.latency_book)
+    args.latency_ms, args.latency_book = prof["latency_ms"], prof["latency_book"] or "same"
+    if prof["ws_db"] and not args.ws_db:
+        args.ws_db = prof["ws_db"]
+    if prof["note"]:
+        print(prof["note"])
     src = Source(args.src)
     lo, hi = src.span()
     if args.days:
@@ -205,7 +216,7 @@ def main():
     engine = run_replay(config, args.src, args.out, t0, t1, only=names, ws_path=args.ws_trades,
                         sigma_mode=args.sigma, latency_book=args.latency_book, progress=prog,
                         keep_snapshots=args.model_check, warm_start=not args.cold_start,
-                        ws_book_path=ws_book, latency_ms=args.latency_ms,
+                        ws_book_path=ws_book, latency_ms=args.latency_ms, extra_slippage=prof["extra_slippage"],
                         ws_book_max_age=float((getattr(config, "RAW", {}).get("replay") or {}).get("ws_book_max_age_s", 60)))
     if args.latency_book == "ws":
         used = sum(1 for r in engine.latency_log if r[2] == "ws")
@@ -220,7 +231,11 @@ def main():
     if open_left:
         print("note: positions with no recorded result stayed open:", open_left)
 
-    d = metrics.load(args.out)
+    d = metrics.load(args.out, include_invalid=args.include_invalid)
+    vc = getattr(engine, "validity_counts", None) or {}
+    print(f"round validity: {vc.get('checked', 0)} rounds checked, {vc.get('invalid', 0)} invalid "
+          f"{vc.get('reasons') or ''}".rstrip())
+    print(metrics.validity_note(d) or "No rounds are marked invalid.")
     if args.holdout:
         cut = t1 - args.holdout * 86400
         report(split_data(d, t0, cut), f"IN-SAMPLE  (rounds before {dt.datetime.fromtimestamp(cut, dt.timezone.utc):%Y-%m-%d %H:%M} UTC)")

@@ -98,7 +98,7 @@ class ConfigTests(unittest.TestCase):
             self.assertIsInstance(names[n], Sniper)
         self.assertEqual(names["s3_sniper_v3b_floor70"].p["min_price"], 0.70)
         self.assertEqual(names["s3_sniper_v3d_model_floor50"].p["signal"], "model")
-        self.assertEqual(names["s4_momentum_edge0_v1"].p["min_edge"], 0.0)
+        self.assertEqual(names["s4_momentum_edge0_v1_t4"].p["min_edge"], 0.0)
         self.assertEqual(names["s4_momentum_min80_v1"].p["min_side_price"], 0.80)
         self.assertEqual(names["s4_momentum_15m_v1"].assets, ["BTC-15m"])
         self.assertEqual(names["s4b_minute_buckets_v2"].p["min_side_price"], 0.50)

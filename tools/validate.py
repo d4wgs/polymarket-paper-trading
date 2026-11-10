@@ -65,7 +65,9 @@ def main(argv=None):
     ap.add_argument("--replay-db", help="analyse an existing replay output instead of replaying again")
     ap.add_argument("--out", default="data/validate_replay.db", help="where the replay result is written")
     ap.add_argument("--ws-db", nargs="?", const="data/ws_events.db", default=None, help="maker fills from ws trade prints")
-    ap.add_argument("--latency-book", choices=["same", "ws"], default="same",
+    ap.add_argument("--profile", help="replay profile from config.yaml replay.profiles, e.g. `pessimistic` "
+                                      "(+1c slippage, 1000 ms latency, later book)")
+    ap.add_argument("--latency-book", choices=["same", "ws", "next"], default=None,
                     help="'ws': fill against order-latency books rebuilt from --ws-db (only valid where the recorder "
                          "has data; falls back to the decision book at gaps). Default: decision-time book.")
     ap.add_argument("--days", type=float, help="replay only the last N days of the recording")
@@ -82,6 +84,8 @@ def main(argv=None):
     ap.add_argument("--export-csv")
     ap.add_argument("--summary-json", help="small dashboard-friendly summary (no per-round data)")
     ap.add_argument("--no-depth", action="store_true", help="skip the book-depth part of the optimism flag")
+    ap.add_argument("--include-invalid", action="store_true",
+                    help="also count rounds marked invalid for data coverage (default: left out of every statistic)")
     args = ap.parse_args(argv)
     logging.basicConfig(level=logging.WARNING, format="%(levelname)s %(name)s: %(message)s")
 
@@ -90,6 +94,11 @@ def main(argv=None):
     if args.reveal_holdout and not (args.holdout_days or args.holdout_frac):
         raise SystemExit("--reveal-holdout needs --holdout-days or --holdout-frac")
 
+    from core.replay import resolve_profile
+    prof = resolve_profile(config.RAW, args.profile, args.ws_db, None, args.latency_book)
+    args.latency_book = prof["latency_book"] or "same"
+    if prof["note"]:
+        print(prof["note"] + (" (ignored: --replay-db reuses an existing replay)" if args.replay_db else ""))
     if args.replay_db:
         out_db = args.replay_db
     else:
@@ -100,16 +109,17 @@ def main(argv=None):
         t0, t1 = (max(lo, hi - span_days * 86400), hi + 1) if span_days else (lo, hi + 1)
         print(f"replaying {dt.datetime.fromtimestamp(t0, dt.timezone.utc):%Y-%m-%d %H:%M} -> "
               f"{dt.datetime.fromtimestamp(t1, dt.timezone.utc):%Y-%m-%d %H:%M} UTC (source read-only) ...", flush=True)
-        ws_book = (args.ws_db or "data/ws_events.db") if args.latency_book == "ws" else None
+        ws_book = (prof["ws_db"] or args.ws_db or "data/ws_events.db") if args.latency_book == "ws" else None
         eng = run_replay(config, args.src, args.out, t0, t1, only=names, ws_path=args.ws_db, warm_start=True,
-                         latency_book=args.latency_book, ws_book_path=ws_book)
+                         latency_book=args.latency_book, ws_book_path=ws_book, latency_ms=prof["latency_ms"],
+                         extra_slippage=prof["extra_slippage"])
         if ws_book:
             used = sum(1 for r in eng.latency_log if r[2] == "ws")
             ws_share = used / max(len(eng.latency_log), 1)
             print(f"latency fetches: {used} websocket books, {len(eng.latency_log) - used} fell back to the decision book")
         out_db = args.out
 
-    d = metrics.load(out_db)
+    d = metrics.load(out_db, include_invalid=args.include_invalid)
     ws_mode = bool(args.latency_book == "ws" and not args.replay_db) or _ws_used(out_db)
     depth = None if args.no_depth else V.make_depth_lookup(args.src)
     rep = V.build_report(
@@ -118,7 +128,7 @@ def main(argv=None):
         n_boot=args.boot_n, seed=args.seed, depth_lookup=depth,
         price_floor=float(cfgv.get("low_price_floor", 0.20)), price_share=float(cfgv.get("low_price_share", 0.25)),
         depth_ratio=float(cfgv.get("depth_ratio", 1.0)), depth_share=float(cfgv.get("depth_share", 0.25)),
-        ws_latency_book=ws_mode)
+        ws_latency_book=ws_mode, controls=getattr(config, "CONTROLS", None))
 
     revealed = 0
     if rep["holdout_revealed"]:
@@ -128,6 +138,7 @@ def main(argv=None):
     else:
         revealed = V.reveal_count(args.reveal_log)
     print()
+    print(metrics.validity_note(d) or "Round validity: no rounds are marked invalid.")
     print(V.render_header(rep, revealed))
     if rep["has_holdout"]:
         cut = dt.datetime.fromtimestamp(rep["cut"], dt.timezone.utc)
@@ -139,6 +150,14 @@ def main(argv=None):
         print(V.render(rep, "holdout"))
     elif rep["has_holdout"]:
         print("\n== HOLDOUT == hidden. Pass --reveal-holdout to see it (each peek is logged).")
+    if rep["paired"]["dev"]:
+        print("\n== STRATEGY MINUS ITS NO-SIGNAL CONTROL (development; only rounds BOTH traded; CI resamples rounds) ==")
+        print(V.render_paired(rep["paired"]["dev"]))
+        if rep["paired"].get("holdout"):
+            print(f"\n== STRATEGY MINUS CONTROL: HOLDOUT (REVEALED; reveal #{revealed}) ==")
+            print(V.render_paired(rep["paired"]["holdout"]))
+        print("diff = strategy P&L - control P&L per round. A signal is worth something only if the CI's lower end "
+              "is above 0.\nonly S / only C = rounds just one of them traded (not compared).")
     flagged = [n for n, s in rep["strategies"].items() if s["dev"].get("flag", {}).get("flag")]
     if flagged:
         print("\nLOW CONFIDENCE ON DOLLARS: " + ", ".join(flagged) + "\n  " + V.OPTIMISM_CAVEAT)
